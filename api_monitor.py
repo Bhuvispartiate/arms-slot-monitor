@@ -15,6 +15,7 @@ Admin commands (only YOUR chat ID can use these):
     /remove <phone>  – remove a subscriber
 """
 
+import os
 import requests
 import json
 import time
@@ -35,9 +36,11 @@ BASE_URL = (
     "?Page=StudentInfobyId&Mode=GetCourseBySlot&Id={slot_id}"
 )
 
-# ARMS session cookie
+# ARMS session cookie — set ARMS_SESSION env var on Railway to avoid
+# hardcoding it here (easy to update without redeploying)
+_session = os.environ.get("ARMS_SESSION", "1rjkayho1tt5ovtqebx5jaku")
 COOKIES = {
-    "ASP.NET_SessionId": "1rjkayho1tt5ovtqebx5jaku",
+    "ASP.NET_SessionId": _session,
 }
 
 HEADERS = {

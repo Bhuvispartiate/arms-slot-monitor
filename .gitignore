@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Data files — don't commit session cookies or subscriber data
+subscribers.json
+baseline_slot*.json
+latest_slot*.json
+slot_monitor.log
+
+# HAR files (contain sensitive session data)
+*.har

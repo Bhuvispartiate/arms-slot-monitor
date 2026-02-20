@@ -36,12 +36,13 @@ BASE_URL = (
     "?Page=StudentInfobyId&Mode=GetCourseBySlot&Id={slot_id}"
 )
 
-# ARMS session cookie — set ARMS_SESSION env var on Railway to avoid
-# hardcoding it here (easy to update without redeploying)
+# ARMS session cookie — mutable dict so /setcookie can update it live
 _session = os.environ.get("ARMS_SESSION", "1rjkayho1tt5ovtqebx5jaku")
-COOKIES = {
-    "ASP.NET_SessionId": _session,
-}
+COOKIES = {"ASP.NET_SessionId": _session}
+
+# Error alert rate-limiting: only alert admin once per error type per hour
+_last_alert: dict[str, float] = {}
+ALERT_COOLDOWN = 3600   # seconds
 
 HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -286,6 +287,29 @@ def handle_remove_user(chat_id: str, phone: str) -> None:
         send_message(chat_id, f"❓ <code>{phone}</code> not found in approved list.")
 
 
+def handle_set_cookie(chat_id: str, value: str) -> None:
+    """Admin command: /setcookie <value> — update session cookie live."""
+    if str(chat_id) != ADMIN_CHAT_ID:
+        send_message(chat_id, "⛔ Not authorised.")
+        return
+
+    value = value.strip()
+    if not value:
+        send_message(chat_id, "Usage: /setcookie &lt;ASP.NET_SessionId value&gt;")
+        return
+
+    COOKIES["ASP.NET_SessionId"] = value
+    # Clear all error alert cooldowns so next poll will re-verify
+    _last_alert.clear()
+    log.info(f"  [Bot] 🔑 Session cookie updated by admin.")
+    send_message(
+        chat_id,
+        f"✅ <b>Session cookie updated!</b>\n"
+        f"<code>{value[:20]}…</code>\n\n"
+        "Monitor will use the new cookie on the next poll (within 15 s).",
+    )
+
+
 # ─────────────────────────────────────────────────────
 #  BOT POLLING THREAD
 # ─────────────────────────────────────────────────────
@@ -334,9 +358,38 @@ def bot_thread():
                     phone = text[8:].strip()
                     handle_remove_user(chat_id, phone)
 
+                elif text.startswith("/setcookie "):
+                    value = text[11:].strip()
+                    handle_set_cookie(chat_id, value)
+
+                elif text == "/setcookie":
+                    send_message(chat_id, "Usage: /setcookie &lt;ASP.NET_SessionId value&gt;\n\nGet it from browser DevTools → Application → Cookies → arms.sse.saveetha.com")
+
         except Exception as e:
             log.warning(f"  [Bot] Poll error: {e}")
             time.sleep(5)
+
+
+# ─────────────────────────────────────────────────────
+#  ERROR ALERT HELPER
+# ─────────────────────────────────────────────────────
+
+def alert_admin(key: str, message: str) -> None:
+    """Send an error alert to admin, rate-limited to once per hour per key."""
+    now = time.time()
+    if now - _last_alert.get(key, 0) < ALERT_COOLDOWN:
+        return   # already alerted recently
+    _last_alert[key] = now
+    log.error(f"  [ALERT] {message}")
+    try:
+        send_message(
+            ADMIN_CHAT_ID,
+            f"⚠️ <b>ARMS Monitor Alert</b>\n\n{message}\n\n"
+            f"<i>🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>\n"
+            "Use /setcookie &lt;value&gt; to update session cookie.",
+        )
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────
@@ -350,11 +403,27 @@ def fetch_courses(slot_id: int) -> list[dict] | None:
         resp.raise_for_status()
         body = resp.text.strip()
         if not body:
-            log.error(f"  [Slot {slot_id}] ❌ Empty response — session cookie may have expired.")
+            alert_admin(
+                f"slot{slot_id}_empty",
+                f"❌ Slot {slot_id}: Empty response — session cookie has likely <b>expired</b>.\n"
+                "Update with /setcookie &lt;new_value&gt;"
+            )
             return None
-        return json.loads(body).get("Table", [])
+        data = json.loads(body).get("Table", [])
+        # Clear any previous empty-response alert for this slot
+        _last_alert.pop(f"slot{slot_id}_empty", None)
+        return data
+    except requests.exceptions.ConnectionError:
+        alert_admin(f"slot{slot_id}_conn", f"🌐 Slot {slot_id}: <b>Connection error</b> — no internet or ARMS is down.")
+        return None
+    except requests.exceptions.Timeout:
+        alert_admin(f"slot{slot_id}_timeout", f"⏱ Slot {slot_id}: <b>Request timed out</b> — ARMS may be slow or unreachable.")
+        return None
+    except requests.exceptions.HTTPError as e:
+        alert_admin(f"slot{slot_id}_http", f"🚫 Slot {slot_id}: <b>HTTP error</b> — {e}")
+        return None
     except Exception as e:
-        log.error(f"  [Slot {slot_id}] Error: {e}")
+        alert_admin(f"slot{slot_id}_err", f"💥 Slot {slot_id}: Unexpected error — {e}")
         return None
 
 
@@ -459,9 +528,10 @@ if __name__ == "__main__":
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"
         "<b>Admin Commands:</b>\n"
-        "/user &lt;phone&gt;  – approve subscriber\n"
-        "/users          – list all subscribers\n"
-        "/remove &lt;phone&gt; – remove subscriber\n\n"
+        "/user &lt;phone&gt;       – approve subscriber\n"
+        "/users             – list all subscribers\n"
+        "/remove &lt;phone&gt;    – remove subscriber\n"
+        "/setcookie &lt;value&gt; – update session cookie live\n\n"
         f"Watching Slots: {SLOT_IDS}",
     )
 

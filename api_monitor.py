@@ -23,6 +23,10 @@ import threading
 import logging
 from datetime import datetime
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load secrets from .env file if present (Wispbyte / local dev)
+load_dotenv()
 
 # ─────────────────────────────────────────────────────
 #  CONFIGURATION

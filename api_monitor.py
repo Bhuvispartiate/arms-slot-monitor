@@ -30,14 +30,21 @@ from pathlib import Path
 
 # Slot IDs to monitor
 SLOT_IDS = [1, 2, 3, 4]
+SLOT_LABELS = {1: "A", 2: "B", 3: "C", 4: "D"}  # Human-friendly labels
 
 BASE_URL = (
     "https://arms.sse.saveetha.com/Handler/Student.ashx"
     "?Page=StudentInfobyId&Mode=GetCourseBySlot&Id={slot_id}"
 )
 
-# ARMS session cookie — mutable dict so /setcookie can update it live
-_session = os.environ.get("ARMS_SESSION", "1rjkayho1tt5ovtqebx5jaku")
+# ARMS credentials for auto-login — set these as Railway environment variables
+ARMS_USERNAME = os.environ.get("ARMS_USERNAME", "")   # ARMS username / roll number
+ARMS_PASSWORD = os.environ.get("ARMS_PASSWORD", "")   # ARMS password
+
+ARMS_LOGIN_URL = "https://arms.sse.saveetha.com/Login.aspx"
+
+# ARMS session cookie — auto-refreshed via login; also settable via /setcookie
+_session = os.environ.get("ARMS_SESSION", "")
 COOKIES = {"ASP.NET_SessionId": _session}
 
 # Error alert rate-limiting: only alert admin once per error type per hour
@@ -59,12 +66,13 @@ HEADERS = {
 # Seconds between slot polls
 POLL_INTERVAL = 15
 
-# ── Telegram ──────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8340772186:AAGa3fzCjNr4TClpvjuRQzizpSaF521-SuY"
+# ── Telegram — set these as Railway environment variables ─────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-ADMIN_CHAT_ID      = "8467592443"    # only this ID can run admin commands
-ADMIN_PHONE        = "9360406137"    # your phone number (for reference)
+ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "")       # only this ID can run admin commands
+ADMIN_PHONE        = os.environ.get("ADMIN_PHONE", "")          # your phone number (for reference)
+CHANNEL_CHAT_ID    = os.environ.get("CHANNEL_CHAT_ID", "")      # private channel — all slot alerts go here
 
 # File that stores subscribers across restarts
 SUBSCRIBERS_FILE   = Path("subscribers.json")
@@ -82,6 +90,81 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────
+#  AUTO-LOGIN
+# ──────────────────────────────────────────────────────
+
+def auto_login() -> bool:
+    """
+    Log into ARMS with ARMS_USERNAME / ARMS_PASSWORD and update
+    COOKIES with the fresh ASP.NET_SessionId.
+    Returns True on success, False on failure.
+    """
+    if not ARMS_USERNAME or not ARMS_PASSWORD:
+        log.warning("  [Login] No credentials set — skipping auto-login.")
+        return False
+
+    try:
+        log.info("  [Login] Attempting auto-login to ARMS…")
+        s = requests.Session()
+
+        # Step 1: GET login page to grab hidden ASP.NET fields
+        r = s.get(ARMS_LOGIN_URL, timeout=15)
+        r.raise_for_status()
+
+        import re
+        def _field(name):
+            m = re.search(rf'id="{name}"[^>]*value="([^"]*)"|name="{name}"[^>]*value="([^"]*)"|value="([^"]*)"[^>]*name="{name}"', r.text)
+            return (m.group(1) or m.group(2) or m.group(3) or "") if m else ""
+
+        viewstate       = _field("__VIEWSTATE")
+        eventvalidation = _field("__EVENTVALIDATION")
+        vsgenerator     = _field("__VIEWSTATEGENERATOR")
+
+        # Step 2: POST credentials
+        payload = {
+            "__VIEWSTATE":          viewstate,
+            "__VIEWSTATEGENERATOR": vsgenerator,
+            "__EVENTVALIDATION":    eventvalidation,
+            "txtusername":          ARMS_USERNAME,
+            "txtpassword":          ARMS_PASSWORD,
+            "btnlogin":             "Login",
+        }
+        resp = s.post(ARMS_LOGIN_URL, data=payload, timeout=15, allow_redirects=True)
+
+        # Step 3: Extract session cookie
+        session_id = s.cookies.get("ASP.NET_SessionId")
+        if not session_id:
+            # Try from response cookies directly
+            session_id = resp.cookies.get("ASP.NET_SessionId")
+
+        if session_id:
+            COOKIES["ASP.NET_SessionId"] = session_id
+            _last_alert.clear()   # reset cooldowns — fresh session
+            log.info(f"  [Login] ✅ Auto-login successful! Session: {session_id[:12]}…")
+            send_message(
+                ADMIN_CHAT_ID,
+                f"🔑 <b>Auto-login successful!</b>\n"
+                f"New session: <code>{session_id[:16]}…</code>"
+            )
+            return True
+        else:
+            log.error("  [Login] ❌ Login failed — bad credentials or ARMS changed its form.")
+            send_message(
+                ADMIN_CHAT_ID,
+                "❌ <b>Auto-login failed!</b>\n"
+                "Could not extract session cookie.\n"
+                "Check username/password or use /setcookie manually."
+            )
+            return False
+
+    except Exception as e:
+        log.error(f"  [Login] ❌ Exception during login: {e}")
+        send_message(ADMIN_CHAT_ID, f"❌ <b>Auto-login error:</b> {e}")
+        return False
+
 
 
 # ─────────────────────────────────────────────────────
@@ -120,15 +203,9 @@ def send_message(chat_id: str | int, text: str, reply_markup=None) -> None:
 
 
 def broadcast(text: str) -> None:
-    """Send a message to all approved subscribers."""
-    db = load_db()
-    subscribers = db.get("approved", [])
-    if not subscribers:
-        log.info("  [Bot] No subscribers to broadcast to.")
-        return
-    log.info(f"  [Bot] Broadcasting to {len(subscribers)} subscriber(s)…")
-    for sub in subscribers:
-        send_message(sub["chat_id"], text)
+    """Send a slot alert to the private channel."""
+    log.info(f"  [Bot] Sending alert to channel {CHANNEL_CHAT_ID}…")
+    send_message(CHANNEL_CHAT_ID, text)
 
 
 # ─────────────────────────────────────────────────────
@@ -403,12 +480,22 @@ def fetch_courses(slot_id: int) -> list[dict] | None:
         resp.raise_for_status()
         body = resp.text.strip()
         if not body:
-            alert_admin(
-                f"slot{slot_id}_empty",
-                f"❌ Slot {slot_id}: Empty response — session cookie has likely <b>expired</b>.\n"
-                "Update with /setcookie &lt;new_value&gt;"
-            )
-            return None
+            # Try auto-login first before alerting admin
+            log.warning(f"  [Slot {slot_id}] Empty response — attempting auto-login…")
+            if auto_login():
+                # Retry the request with the new cookie
+                try:
+                    resp2 = requests.get(url, headers=HEADERS, cookies=COOKIES, timeout=15)
+                    body = resp2.text.strip()
+                except Exception:
+                    body = ""
+            if not body:
+                alert_admin(
+                    f"slot{slot_id}_empty",
+                    f"❌ Slot {slot_id}: Empty response — session cookie has likely <b>expired</b>.\n"
+                    "Auto-login also failed. Update with /setcookie &lt;new_value&gt;"
+                )
+                return None
         data = json.loads(body).get("Table", [])
         # Clear any previous empty-response alert for this slot
         _last_alert.pop(f"slot{slot_id}_empty", None)
@@ -490,7 +577,8 @@ def monitor_thread():
                         added_lines.append(f"  ➕ {c['SubjectCode']} – {c['SubjectName']} ({c['AvailableCount']} slots)")
 
                 # Build Telegram message
-                tg = [f"<b>🔔 ARMS Slot {slot_id}: New Course Added! ▲</b>",
+                label = SLOT_LABELS.get(slot_id, str(slot_id))
+                tg = [f"<b>🔔 ARMS Slot {label}: New Course Added! ▲</b>",
                       f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
                 if added_lines:
                     tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
@@ -523,16 +611,29 @@ if __name__ == "__main__":
         save_db({"approved": [], "pending": {}})
         log.info("  Created subscribers.json")
 
+    # Auto-login to get a fresh session cookie
+    if ARMS_USERNAME and ARMS_PASSWORD:
+        auto_login()
+    else:
+        log.info("  [Login] Running with hardcoded session cookie (no credentials set).")
+
     # Startup message to admin
     send_message(
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"
-        "<b>Admin Commands:</b>\n"
-        "/user &lt;phone&gt;       – approve subscriber\n"
-        "/users             – list all subscribers\n"
-        "/remove &lt;phone&gt;    – remove subscriber\n"
+        "Slot alerts → private channel 🔔\n"
         "/setcookie &lt;value&gt; – update session cookie live\n\n"
         f"Watching Slots: {SLOT_IDS}",
+    )
+
+    # Notify the channel that monitoring has started
+    slot_labels_str = ", ".join(SLOT_LABELS[s] for s in SLOT_IDS)
+    send_message(
+        CHANNEL_CHAT_ID,
+        "🟢 <b>ARMS Slot Monitor — Started!</b>\n\n"
+        f"👁 Watching Slots: <b>{slot_labels_str}</b>\n"
+        f"⏱ Poll Interval: every <b>{POLL_INTERVAL}s</b>\n\n"
+        "You'll be notified here the moment a new course slot opens. 🔔",
     )
 
     # Start bot in background thread

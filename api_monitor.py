@@ -46,8 +46,8 @@ BASE_URL = (
 )
 
 # ARMS credentials for auto-login
-ARMS_USERNAME = "Ssetsec242"   # ARMS username / roll number
-ARMS_PASSWORD = "aadhiran@13"   # ARMS password
+ARMS_USERNAME = os.environ.get("ARMS_USERNAME", "")   # ARMS username / roll number
+ARMS_PASSWORD = os.environ.get("ARMS_PASSWORD", "")   # ARMS password
 
 ARMS_LOGIN_URL = "https://arms.sse.saveetha.com/Login.aspx"
 
@@ -75,12 +75,12 @@ HEADERS = {
 POLL_INTERVAL = 20
 
 # ── Telegram ─────────────────────
-TELEGRAM_BOT_TOKEN = "8340772186:AAGa3fzCjNr4TClpvjuRQzizpSaF521-SuY"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-ADMIN_CHAT_ID      = "8467592443"       # only this ID can run admin commands
-ADMIN_PHONE        = "9360406137"          # your phone number (for reference)
-CHANNEL_CHAT_ID    = "-1003845063774"      # private channel — all slot alerts go here
+ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "")       # only this ID can run admin commands
+ADMIN_PHONE        = os.environ.get("ADMIN_PHONE", "")          # your phone number (for reference)
+CHANNEL_CHAT_ID    = os.environ.get("CHANNEL_CHAT_ID", "")      # private channel — all slot alerts go here
 
 # File that stores subscribers across restarts
 SUBSCRIBERS_FILE   = Path("subscribers.json")
@@ -659,15 +659,259 @@ def handle_shutdown(signum=None, frame=None):
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────
 
-def dummy_server():
-    port = int(os.environ.get("PORT", 7860))
-    Handler = http.server.SimpleHTTPRequestHandler
+# ─────────────────────────────────────────────────────
+#  WEB DASHBOARD (Flask)
+# ─────────────────────────────────────────────────────
+
+from flask import Flask, jsonify, request, Response
+
+app = Flask(__name__)
+
+# Basic Auth Credentials
+DASHBOARD_USER = "admin"
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "saveetha123") # Change this in .env!
+
+def check_auth(username, password):
+    return username == DASHBOARD_USER and password == DASHBOARD_PASS
+
+def authenticate():
+    return Response(
+    'Could not verify your access level for that URL.\n'
+    'You have to login with proper credentials', 401,
+    {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+def requires_auth(f):
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    decorated.__name__ = f.__name__
+    return decorated
+
+@app.route("/")
+@requires_auth
+def index():
+    # Return a premium Glassmorphism React/Vanilla-JS Dashboard
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ARMS Monitor Control Panel</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --bg-color: #0d1117;
+                --card-bg: rgba(22, 27, 34, 0.6);
+                --card-border: rgba(255, 255, 255, 0.1);
+                --text-main: #c9d1d9;
+                --text-muted: #8b949e;
+                --accent: #58a6ff;
+                --success: #238636;
+                --danger: #da3633;
+            }
+            body {
+                background-color: var(--bg-color);
+                background-image: radial-gradient(circle at 15% 50%, rgba(88, 166, 255, 0.15), transparent 25%),
+                                  radial-gradient(circle at 85% 30%, rgba(35, 134, 54, 0.15), transparent 25%);
+                color: var(--text-main);
+                font-family: 'Outfit', sans-serif;
+                margin: 0;
+                padding: 2rem;
+                min-height: 100vh;
+                box-sizing: border-box;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: 300px 1fr;
+                gap: 2rem;
+            }
+            @media (max-width: 768px) {
+                .container { grid-template-columns: 1fr; }
+            }
+            .header {
+                grid-column: 1 / -1;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid var(--card-border);
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+            }
+            h1 { margin: 0; font-weight: 600; font-size: 1.8rem; letter-spacing: -0.5px; display:flex; align-items:center; gap: 10px; }
+            .status-badge {
+                background: rgba(35, 134, 54, 0.2);
+                color: #3fb950;
+                padding: 5px 12px;
+                border-radius: 20px;
+                font-size: 0.85rem;
+                font-weight: 600;
+                border: 1px solid rgba(63, 185, 80, 0.4);
+                animation: pulse 2s infinite;
+            }
+            @keyframes pulse {
+                0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
+                70% { box-shadow: 0 0 0 10px rgba(63, 185, 80, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
+            }
+            .glass-panel {
+                background: var(--card-bg);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                border: 1px solid var(--card-border);
+                border-radius: 16px;
+                padding: 1.5rem;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            }
+            .stat-grid {
+                display: grid;
+                grid-template-columns: 1fr;
+                gap: 1rem;
+            }
+            .stat-card {
+                background: rgba(255,255,255,0.03);
+                border-radius: 12px;
+                padding: 1rem;
+                border: 1px solid rgba(255,255,255,0.05);
+            }
+            .stat-value { font-size: 2rem; font-weight: 600; color: var(--accent); margin-top: 5px;}
+            .stat-label { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px;}
+            
+            #log-container {
+                background: #010409;
+                border-radius: 8px;
+                padding: 1rem;
+                height: 600px;
+                overflow-y: auto;
+                font-family: 'Courier New', Courier, monospace;
+                font-size: 0.9rem;
+                line-height: 1.5;
+                border: 1px solid #30363d;
+                scrollbar-width: thin;
+                scrollbar-color: #58a6ff #010409;
+            }
+            .log-line { border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0; }
+            .log-time { color: var(--text-muted); margin-right: 15px; }
+            .log-info { color: #8a2be2; }
+            .log-warn { color: #d29922; }
+            .log-err { color: var(--danger); }
+            .log-success { color: #3fb950;}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🎓 ARMS Slot Monitor</h1>
+                <div class="status-badge">● SYSTEM ONLINE</div>
+            </div>
+            
+            <div class="sidebar">
+                <div class="glass-panel stat-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Subscribers</div>
+                        <div class="stat-value" id="sub-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Monitored Slots</div>
+                        <div class="stat-value" id="slot-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Last Poll Update</div>
+                        <div class="stat-value" style="font-size:1.2rem; color:#c9d1d9;" id="last-poll">Waiting...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="main-content">
+                <div class="glass-panel">
+                    <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Live Terminal Logs</h2>
+                    <div id="log-container">Loading system logs...</div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            function formatLog(line) {
+                if(!line) return '';
+                let formatted = line.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                
+                // Colorize based on keywords
+                if(formatted.includes("[Bot]") || formatted.includes("[Monitor]")) formatted = `<span class="log-info">${formatted}</span>`;
+                if(formatted.includes("⚠") || formatted.includes("WARNING")) formatted = `<span class="log-warn">${formatted}</span>`;
+                if(formatted.includes("❌") || formatted.includes("ERROR")) formatted = `<span class="log-err">${formatted}</span>`;
+                if(formatted.includes("✅") || formatted.includes("started")) formatted = `<span class="log-success">${formatted}</span>`;
+                
+                // Extract timestamp if it exists (assuming format HH:MM:SS at start)
+                const timeMatch = formatted.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)/);
+                if(timeMatch) {
+                    return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
+                }
+                return `<div class="log-line">${formatted}</div>`;
+            }
+
+            async function updateDashboard() {
+                try {
+                    const statsRes = await fetch('/api/stats');
+                    const stats = await statsRes.json();
+                    document.getElementById('sub-count').innerText = stats.subscribers;
+                    document.getElementById('slot-count').innerText = stats.slots;
+                    document.getElementById('last-poll').innerText = stats.time;
+
+                    const logsRes = await fetch('/api/logs');
+                    const logsData = await logsRes.json();
+                    
+                    const logContainer = document.getElementById('log-container');
+                    const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 50;
+                    
+                    logContainer.innerHTML = logsData.logs.map(formatLog).join('');
+                    
+                    if(isScrolledToBottom) {
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }
+                } catch(e) {
+                    console.error("Dashboard update failed", e);
+                }
+            }
+
+            // Update immediately, then every 3 seconds
+            updateDashboard();
+            setInterval(updateDashboard, 3000);
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route("/api/stats")
+@requires_auth
+def api_stats():
+    db = load_db()
+    return jsonify({
+        "subscribers": len(db.get("approved", [])),
+        "slots": len(SLOT_IDS),
+        "time": datetime.now().strftime("%I:%M:%S %p")
+    })
+
+@app.route("/api/logs")
+@requires_auth
+def api_logs():
     try:
-        with socketserver.TCPServer(("", port), Handler) as httpd:
-            log.info(f"  [Web] Dummy server running on port {port} for Render")
-            httpd.serve_forever()
+        # Read last 150 lines efficiently
+        with open("slot_monitor.log", "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            return jsonify({"logs": lines[-150:]})
     except Exception as e:
-        log.error(f"  [Web] Dummy server failed: {e}")
+        return jsonify({"logs": [f"Error reading logs: {e}"]})
+
+def flask_server():
+    port = int(os.environ.get("PORT", 8080))  # Default Alwaysdata WSGI port
+    log.info(f"  [Web] Starting Flask Dashboard on port {port}")
+    # Run Flask with Waitress or standard Werkzeug for now
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 if __name__ == "__main__":
     log.info("=" * 60)
@@ -699,8 +943,8 @@ if __name__ == "__main__":
         "/setcookie &lt;value&gt; – update session cookie live",
     )
 
-    # Start dummy web server in background thread for Render
-    t_web = threading.Thread(target=dummy_server, daemon=True, name="WebThread")
+    # Start Flask Web Dashboard in background thread for Alwaysdata HTTP
+    t_web = threading.Thread(target=flask_server, daemon=True, name="WebThread")
     t_web.start()
 
     # Start bot in background thread

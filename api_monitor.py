@@ -21,6 +21,7 @@ import json
 import time
 import threading
 import logging
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -35,10 +36,6 @@ load_dotenv()
 # ─────────────────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────
-
-# Slot IDs to monitor
-SLOT_IDS = [1, 2, 3, 4]
-SLOT_LABELS = {1: "A", 2: "B", 3: "C", 4: "D"}  # Human-friendly labels
 
 BASE_URL = (
     "https://arms.sse.saveetha.com/Handler/Student.ashx"
@@ -180,9 +177,56 @@ def auto_login() -> bool:
 # ─────────────────────────────────────────────────────
 
 def load_db() -> dict:
+    default_db = {
+        "approved": [], 
+        "pending": {},
+        "slots": [
+            {"id": 4, "label": "A"},
+            {"id": 5, "label": "B"},
+            {"id": 2, "label": "C"},
+            {"id": 7, "label": "D"}
+        ]
+    }
     if SUBSCRIBERS_FILE.exists():
-        return json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
-    return {"approved": [], "pending": {}}
+        try:
+            data = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
+            # Ensure new schema fields exist
+            if "slots" not in data:
+                data["slots"] = default_db["slots"]
+            return data
+        except json.JSONDecodeError:
+            pass
+    return default_db
+    
+# ─────────────────────────────────────────────────────
+#  ANALYTICS STORAGE (SQLite)
+# ─────────────────────────────────────────────────────
+
+def init_history_db():
+    conn = sqlite3.connect("history.db")
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            slot_id INTEGER,
+            course_count INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def log_history(slot_id: int, course_count: int):
+    try:
+        conn = sqlite3.connect("history.db")
+        c = conn.cursor()
+        c.execute("INSERT INTO history (slot_id, course_count) VALUES (?, ?)", (slot_id, course_count))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"  [DB] SQLite history logging failed: {e}")
+
+init_history_db()
 
 
 def save_db(db: dict) -> None:
@@ -569,66 +613,90 @@ def summarise(courses: list[dict]) -> str:
 
 def monitor_thread():
     log.info("  [Monitor] Starting slot monitor…")
+    global _last_alert
+    
+    # Store known counts per slot
     baselines: dict[int, dict] = {}
     poll = 0
 
     while True:
+        db = load_db()
+        active_slots = db.get("slots", [])
+        
         poll += 1
         log.info(f"\n[Poll #{poll:04d}]  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        for slot_id in SLOT_IDS:
-            courses = fetch_courses(slot_id)
-            if courses is None:
-                log.warning(f"  [Slot {slot_id}] ⚠  No response, skipping.")
-                continue
+        for slot_data in active_slots:
+            try:
+                slot_id = slot_data["id"]
+                slot_label = slot_data["label"]
+                
+                courses = fetch_courses(slot_id)
+                if courses is None:
+                    log.warning(f"  [Slot {slot_label}] ⚠  No response, skipping.")
+                    continue
 
-            current_count = len(courses)
+                current_count = len(courses)
+                log_history(slot_id, current_count)
 
-            if slot_id not in baselines:
-                log.info(f"  [Slot {slot_id}] ✅ Baseline: {current_count} courses.")
-                baselines[slot_id] = {"count": current_count, "courses": courses}
-                continue
+                if slot_id not in baselines:
+                    log.info(f"  [Slot {slot_label}] ✅ Baseline: {current_count} courses.")
+                    baselines[slot_id] = {"count": current_count, "courses": courses}
+                    continue
 
-            prev_count   = baselines[slot_id]["count"]
-            prev_courses = baselines[slot_id]["courses"]
+                prev_count   = baselines[slot_id]["count"]
+                prev_courses = baselines[slot_id]["courses"]
 
-            if current_count != prev_count:
-                # Update baseline and file only when data actually changes
-                baselines[slot_id] = {"count": current_count, "courses": courses}
-                with open(f"latest_slot{slot_id}.json", "w", encoding="utf-8") as f:
-                    json.dump(courses, f, indent=2, ensure_ascii=False)
+                if current_count != prev_count:
+                    # Update baseline and file only when data actually changes
+                    baselines[slot_id] = {"count": current_count, "courses": courses}
+                    with open(f"latest_slot{slot_id}.json", "w", encoding="utf-8") as f:
+                        json.dump(courses, f, indent=2, ensure_ascii=False)
 
-            if current_count > prev_count:
-                # Only notify on INCREASE
-                delta = current_count - prev_count
+                    if current_count > prev_count:
+                        # Only notify on INCREASE
+                        delta = current_count - prev_count
 
-                log.info(f"  [Slot {slot_id}] 🔔 COUNT INCREASED: {prev_count} → {current_count} (+{delta})")
+                        log.info(f"  [Slot {slot_label}] 🔔 COUNT INCREASED: {prev_count} → {current_count} (+{delta})")
 
-                prev_ids = {c["SubjectId"]: c for c in prev_courses}
-                curr_ids = {c["SubjectId"]: c for c in courses}
+                        prev_ids = {c["SubjectId"]: c for c in prev_courses}
+                        curr_ids = {c["SubjectId"]: c for c in courses}
 
-                added_lines = []
-                for sid, c in curr_ids.items():
-                    if sid not in prev_ids:
-                        added_lines.append(f"  ➕ {c['SubjectCode']} – {c['SubjectName']} ({c['AvailableCount']} slots)")
+                        added_lines = []
+                        for sid, c in curr_ids.items():
+                            if sid not in prev_ids:
+                                added_lines.append(f"  ➕ {c['SubjectCode']} – {c['SubjectName']} ({c['AvailableCount']} slots)")
 
-                # Build Telegram message
-                label = SLOT_LABELS.get(slot_id, str(slot_id))
-                tg = [f"<b>🔔 ARMS Slot {label}: New Course Added! ▲</b>",
-                      f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
-                if added_lines:
-                    tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
-                tg.append(f"\n🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
-                tg_text = "\n".join(tg)
+                        # Build Telegram message
+                        tg = [f"<b>🔔 ARMS Slot {slot_label}: New Course Added! ▲</b>",
+                              f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
+                        if added_lines:
+                            tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
+                        tg.append(f"\n🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
+                        tg_text = "\n".join(tg)
 
-                broadcast(tg_text)
-                send_message(ADMIN_CHAT_ID, tg_text)
+                        # Broadcast to all approved subscribers
+                        db = load_db()
+                        u_list = db.get("approved", [])
+                        msg = {"chat_id": 0, "text": tg_text, "parse_mode": "HTML"}
+                        
+                        log.info(f"  [Slot {slot_label}] Broadcasting alert to {len(u_list)} users.")
+                        for u_id in u_list:
+                            msg["chat_id"] = u_id
+                            tg_post("sendMessage", **msg)
+                        
+                        # Also send separately to admin
+                        send_message(ADMIN_CHAT_ID, tg_text)
 
-            elif current_count < prev_count:
-                log.info(f"  [Slot {slot_id}] 📉 Count decreased {prev_count}→{current_count} (no notification sent)")
-            else:
-                pass  # Reduced logging: only log on changes
+                    elif current_count < prev_count:
+                        log.info(f"  [Slot {slot_id}] 📉 Count decreased {prev_count}→{current_count} (no notification sent)")
+                    else:
+                        pass  # Reduced logging: only log on changes
 
+            except Exception as e:
+                log.error(f"  [Slot {slot_label}] ❌ Error processing courses: {e}")
+
+        # Sleep before next poll
         time.sleep(POLL_INTERVAL)
 
 
@@ -701,6 +769,7 @@ def index():
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>ARMS Monitor Control Panel</title>
         <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             :root {
                 --bg-color: #0d1117;
@@ -766,6 +835,7 @@ def index():
                 border-radius: 16px;
                 padding: 1.5rem;
                 box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                margin-bottom: 1.5rem;
             }
             .stat-grid {
                 display: grid;
@@ -785,7 +855,7 @@ def index():
                 background: #010409;
                 border-radius: 8px;
                 padding: 1rem;
-                height: 600px;
+                height: 350px;
                 overflow-y: auto;
                 font-family: 'Courier New', Courier, monospace;
                 font-size: 0.9rem;
@@ -800,6 +870,29 @@ def index():
             .log-warn { color: #d29922; }
             .log-err { color: var(--danger); }
             .log-success { color: #3fb950;}
+
+            .tabs { display: flex; gap: 10px; margin-bottom: 1rem; }
+            .tab-btn {
+                background: rgba(255,255,255,0.05); color: var(--text-main); border: 1px solid var(--card-border);
+                padding: 8px 16px; border-radius: 8px; cursor: pointer; font-family: 'Outfit'; transition: 0.2s;
+            }
+            .tab-btn.active { background: var(--accent); color: #000; font-weight: bold; border-color: var(--accent); }
+            .tab-content { display: none; }
+            .tab-content.active { display: block; }
+
+            .input-group { margin-bottom: 1rem; }
+            .input-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size:0.9rem; }
+            .input-group input { 
+                width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--card-border); 
+                background: rgba(0,0,0,0.3); color: white; font-family: 'Outfit'; box-sizing: border-box;
+            }
+            .btn {
+                background: var(--success); color: white; border: none; padding: 10px 20px;
+                border-radius: 6px; cursor: pointer; font-family: 'Outfit'; font-weight: 600;
+            }
+            .slot-row { display: flex; gap: 10px; margin-bottom: 10px; align-items:center; }
+            .slot-row input { flex:1; }
+            .btn-danger { background: var(--danger); }
         </style>
     </head>
     <body>
@@ -827,33 +920,59 @@ def index():
             </div>
 
             <div class="main-content">
-                <div class="glass-panel">
-                    <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Live Terminal Logs</h2>
-                    <div id="log-container">Loading system logs...</div>
+                <div class="tabs">
+                    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
+                    <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
+                </div>
+
+                <div id="tab-overview" class="tab-content active">
+                    <div class="glass-panel">
+                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Analytics History (24h)</h2>
+                        <div style="height: 250px; width: 100%;">
+                            <canvas id="analyticsChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel">
+                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Live Terminal Logs</h2>
+                        <div id="log-container">Loading system logs...</div>
+                    </div>
+                </div>
+
+                <div id="tab-settings" class="tab-content glass-panel">
+                    <h2 style="margin-top:0;">Slot Configuration</h2>
+                    <p style="color:var(--text-muted); font-size:0.9rem;">Change which ARMS slots are actively monitored. The background bot updates instantly upon save.</p>
+                    
+                    <div id="slots-editor"></div>
+                    
+                    <button class="tab-btn" onclick="addSlotRow()" style="margin-top:10px;">+ Add Slot</button>
+                    <br><br>
+                    <button class="btn" onclick="saveSlots()">💾 Save Configuration</button>
                 </div>
             </div>
         </div>
 
         <script>
+            let chartInstance = null;
+
+            function switchTab(tabId) {
+                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+                document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+                document.getElementById('tab-' + tabId).classList.add('active');
+                event.target.classList.add('active');
+                if(tabId === 'settings') loadSettings();
+            }
+
             function formatLog(line) {
                 if(!line) return '';
-                
-                // Completely hide dashboard API polling logs from the Web UI
-                if(line.includes("GET /api/")) return '';
-                
+                if(line.includes("GET /api/")) return ''; // Hide dashboard noise
                 let formatted = line.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-                
-                // Colorize based on keywords
                 if(formatted.includes("[Bot]") || formatted.includes("[Monitor]")) formatted = `<span class="log-info">${formatted}</span>`;
                 if(formatted.includes("⚠") || formatted.includes("WARNING")) formatted = `<span class="log-warn">${formatted}</span>`;
                 if(formatted.includes("❌") || formatted.includes("ERROR")) formatted = `<span class="log-err">${formatted}</span>`;
-                if(formatted.includes("✅") || formatted.includes("started")) formatted = `<span class="log-success">${formatted}</span>`;
-                
-                // Extract timestamp if it exists (assuming format HH:MM:SS at start)
+                if(formatted.includes("✅") || formatted.includes("started") || formatted.includes("INCREASED")) formatted = `<span class="log-success">${formatted}</span>`;
                 const timeMatch = formatted.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)/);
-                if(timeMatch) {
-                    return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
-                }
+                if(timeMatch) return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
                 return `<div class="log-line">${formatted}</div>`;
             }
 
@@ -867,23 +986,86 @@ def index():
 
                     const logsRes = await fetch('/api/logs');
                     const logsData = await logsRes.json();
-                    
                     const logContainer = document.getElementById('log-container');
                     const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 50;
-                    
                     logContainer.innerHTML = logsData.logs.map(formatLog).join('');
-                    
-                    if(isScrolledToBottom) {
-                        logContainer.scrollTop = logContainer.scrollHeight;
-                    }
-                } catch(e) {
-                    console.error("Dashboard update failed", e);
+                    if(isScrolledToBottom) logContainer.scrollTop = logContainer.scrollHeight;
+
+                    // Fetch chart history
+                    const histRes = await fetch('/api/history');
+                    updateChart(await histRes.json());
+                } catch(e) { console.error("Update failed", e); }
+            }
+
+            function updateChart(data) {
+                const ctx = document.getElementById('analyticsChart').getContext('2d');
+                if(!chartInstance) {
+                    chartInstance = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: data.labels,
+                            datasets: data.datasets
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            animation: false,
+                            scales: {
+                                y: { beginAtZero: false, grid: {color: 'rgba(255,255,255,0.05)'}, ticks: {color: '#8b949e'} },
+                                x: { grid: {display: false}, ticks: {color: '#8b949e', maxTicksLimit: 10} }
+                            },
+                            plugins: {
+                                legend: { labels: { color: '#c9d1d9' } }
+                            }
+                        }
+                    });
+                } else {
+                    chartInstance.data.labels = data.labels;
+                    chartInstance.data.datasets = data.datasets;
+                    chartInstance.update();
                 }
             }
 
-            // Update immediately, then every 3 seconds
+            // --- Settings Editor Logic ---
+            async function loadSettings() {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                const container = document.getElementById('slots-editor');
+                container.innerHTML = '';
+                data.slots.forEach(s => addSlotRow(s.id, s.label));
+            }
+
+            function addSlotRow(id = '', label = '') {
+                const row = document.createElement('div');
+                row.className = 'slot-row';
+                row.innerHTML = `
+                    <input type="number" placeholder="Slot ID (e.g. 1)" value="${id}" class="s-id">
+                    <input type="text" placeholder="Label (e.g. A-1)" value="${label}" class="s-label">
+                    <button class="btn btn-danger" onclick="this.parentElement.remove()">X</button>
+                `;
+                document.getElementById('slots-editor').appendChild(row);
+            }
+
+            async function saveSlots() {
+                const rows = document.querySelectorAll('.slot-row');
+                const newSlots = [];
+                rows.forEach(r => {
+                    const id = parseInt(r.querySelector('.s-id').value);
+                    const label = r.querySelector('.s-label').value;
+                    if(!isNaN(id) && label) newSlots.push({id, label});
+                });
+                
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({slots: newSlots})
+                });
+                alert('Saved! The bot will use these slots on its next poll.');
+            }
+
+            // Init loop
             updateDashboard();
-            setInterval(updateDashboard, 3000);
+            setInterval(updateDashboard, 5000);
         </script>
     </body>
     </html>
@@ -896,9 +1078,68 @@ def api_stats():
     db = load_db()
     return jsonify({
         "subscribers": len(db.get("approved", [])),
-        "slots": len(SLOT_IDS),
+        "slots": len(db.get("slots", [])),
         "time": datetime.now().strftime("%I:%M:%S %p")
     })
+
+@app.route("/api/history")
+@requires_auth
+def api_history():
+    # Provide Chart.js formatting from SQLite History
+    db = load_db()
+    active_slots = db.get("slots", [])
+    
+    conn = sqlite3.connect("history.db")
+    c = conn.cursor()
+    # Fetch last 50 distinct timestamps
+    c.execute("SELECT DISTINCT timestamp FROM history ORDER BY timestamp DESC LIMIT 50")
+    times = [r[0] for r in c.fetchall()][::-1] 
+    
+    datasets = []
+    colors = ['#58a6ff', '#238636', '#d29922', '#8a2be2', '#da3633']
+    
+    for idx, slot in enumerate(active_slots):
+        sid = slot["id"]
+        color = colors[idx % len(colors)]
+        
+        c.execute("SELECT timestamp, course_count FROM history WHERE slot_id = ? ORDER BY timestamp DESC LIMIT 50", (sid,))
+        # Map out the values against the standard times
+        raw_data = {r[0]: r[1] for r in c.fetchall()}
+        
+        data_points = []
+        last_val = 0
+        for t in times:
+            if t in raw_data:
+                last_val = raw_data[t]
+            data_points.append(last_val)
+            
+        datasets.append({
+            "label": f"Slot {slot['label']} ({sid})",
+            "data": data_points,
+            "borderColor": color,
+            "backgroundColor": color + "33",
+            "borderWidth": 2,
+            "pointRadius": 0,
+            "fill": True,
+            "tension": 0.4
+        })
+    conn.close()
+    
+    # Format labels cleanly (HH:MM)
+    clean_labels = [datetime.strptime(t, "%Y-%m-%d %H:%M:%S").strftime("%H:%M") for t in times]
+    return jsonify({"labels": clean_labels, "datasets": datasets})
+
+@app.route("/api/settings", methods=["GET", "POST"])
+@requires_auth
+def api_settings():
+    db = load_db()
+    if request.method == "POST":
+        data = request.json
+        if "slots" in data:
+            db["slots"] = data["slots"]
+            save_db(db)
+            return jsonify({"status": "success"})
+    return jsonify({"slots": db.get("slots", [])})
 
 @app.route("/api/logs")
 @requires_auth

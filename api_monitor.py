@@ -971,7 +971,7 @@ def index():
                 if(formatted.includes("⚠") || formatted.includes("WARNING")) formatted = `<span class="log-warn">${formatted}</span>`;
                 if(formatted.includes("❌") || formatted.includes("ERROR")) formatted = `<span class="log-err">${formatted}</span>`;
                 if(formatted.includes("✅") || formatted.includes("started") || formatted.includes("INCREASED")) formatted = `<span class="log-success">${formatted}</span>`;
-                const timeMatch = formatted.match(/^(\d{2}:\d{2}:\d{2})\s+(.*)/);
+                const timeMatch = formatted.match(/^(\\d{2}:\\d{2}:\\d{2})\\s+(.*)/);
                 if(timeMatch) return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
                 return `<div class="log-line">${formatted}</div>`;
             }
@@ -1179,9 +1179,13 @@ def flask_server():
     )
 
 if __name__ == "__main__":
+    db_init = load_db()
+    active_slots_init = db_init.get("slots", [])
+    slot_ids_init = [s["id"] for s in active_slots_init]
+    
     log.info("=" * 60)
     log.info("  ARMS Slot Monitor  –  Multi-User Bot Service")
-    log.info(f"  Admin : {ADMIN_CHAT_ID}  |  Slots: {SLOT_IDS}")
+    log.info(f"  Admin : {ADMIN_CHAT_ID}  |  Slots: {slot_ids_init}")
     log.info("=" * 60)
 
     # Ensure subscribers file exists
@@ -1199,7 +1203,7 @@ if __name__ == "__main__":
     set_bot_profile()
 
     # Startup message to admin
-    slot_labels_str = ", ".join(SLOT_LABELS[s] for s in SLOT_IDS)
+    slot_labels_str = ", ".join(s["label"] for s in active_slots_init) if active_slots_init else "None"
     send_message(
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"

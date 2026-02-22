@@ -942,29 +942,37 @@ def index():
 
             /* Modern Mobile Responsiveness */
             @media (max-width: 900px) {
+                body { padding: 1rem; }
                 .container { 
                     grid-template-columns: 1fr; 
-                    padding: 1rem;
+                    gap: 1.5rem;
                 }
                 .sidebar { order: -1; } /* Bring stats to top on mobile */
-                .stat-grid {
-                    grid-template-columns: repeat(2, 1fr);
-                }
+                .stat-grid { grid-template-columns: repeat(2, 1fr); }
                 .stat-card[style*="grid-column"] { grid-column: 1 / -1 !important; }
-                
                 h1 { font-size: 1.5rem; }
-                .glass-panel { padding: 1.2rem; border-radius: 16px; }
-                .stat-value { font-size: 1.8rem; }
+            }
+            
+            @media (max-width: 600px) {
+                body { padding: 0.5rem; }
+                .container { gap: 1rem; }
+                .glass-panel { padding: 1.2rem; border-radius: 16px; margin-bottom: 1rem; }
+                .stat-grid { gap: 0.8rem; }
+                .stat-card { padding: 1rem; }
+                .stat-value { font-size: 1.6rem; }
+                .stat-label { font-size: 0.75rem; }
                 
-                #log-container { height: 350px; font-size: 0.8rem; }
+                .header { flex-direction: column; align-items: flex-start; gap: 0.8rem; }
+                .status-badge { align-self: flex-start; font-size: 0.8rem; padding: 4px 12px; }
+                
+                #log-container { height: 300px; font-size: 0.8rem; padding: 0.8rem; }
                 .slot-row { flex-direction: column; align-items: stretch; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;}
-                .btn-danger { align-self: flex-end; width: 100%; }
+                .btn-danger { width: 100%; margin-top: 5px; }
+                .tab-btn { padding: 8px 16px; font-size: 0.9rem; }
             }
             
             @media (max-width: 400px) {
                 .stat-grid { grid-template-columns: 1fr; }
-                .header { flex-direction: column; align-items: flex-start; }
-                .status-badge { align-self: flex-start; }
             }
         </style>
     </head>

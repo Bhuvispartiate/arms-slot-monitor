@@ -23,6 +23,7 @@ import threading
 import logging
 import sqlite3
 from datetime import datetime
+import pytz
 from pathlib import Path
 from dotenv import load_dotenv
 import signal
@@ -233,10 +234,16 @@ def save_db(db: dict) -> None:
     SUBSCRIBERS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # ─────────────────────────────────────────────────────
-#  GLOBAL METRICS
+#  GLOBAL METRICS & TIMEZONE
 # ─────────────────────────────────────────────────────
+
+IST = pytz.timezone('Asia/Kolkata')
+
+def get_ist_now():
+    return datetime.now(IST)
+
 GLOBAL_METRICS = {
-    "start_time": datetime.now(),
+    "start_time": get_ist_now(),
     "polls": 0,
     "latency": "0.00s",
     "total_courses": 0
@@ -632,7 +639,7 @@ def monitor_thread():
         active_slots = db.get("slots", [])
         
         GLOBAL_METRICS["polls"] += 1
-        log.info(f"\n[Poll #{GLOBAL_METRICS['polls']:04d}]  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log.info(f"\n[Poll #{GLOBAL_METRICS['polls']:04d}]  {get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
 
         cycle_courses_count = 0
         cycle_start_t = time.time()
@@ -689,7 +696,7 @@ def monitor_thread():
                               f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
                         if added_lines:
                             tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
-                        tg.append(f"\n🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
+                        tg.append(f"\n🕐 <i>{get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p IST')}</i>")
                         tg_text = "\n".join(tg)
 
                         # Broadcast to all approved subscribers
@@ -749,19 +756,19 @@ def handle_shutdown(signum=None, frame=None):
 # ─────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────
-#  WEB DASHBOARD (Flask)
+#  FLASK WEB DASHBOARD & API
 # ─────────────────────────────────────────────────────
-
-from flask import Flask, jsonify, request, Response
+from flask import Flask, request, jsonify, Response
+from functools import wraps
+import pytz # Added pytz import
 
 app = Flask(__name__)
 
-# Basic Auth Credentials
-DASHBOARD_USER = "admin"
-DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "saveetha123") # Change this in .env!
-
+# Basic Authentication wrapper
 def check_auth(username, password):
-    return username == DASHBOARD_USER and password == DASHBOARD_PASS
+    env_user = os.environ.get("DASHBOARD_USER", "KnightWinner")
+    env_pass = os.environ.get("DASHBOARD_PASS", "9360406137")
+    return username == env_user and password == env_pass
 
 def authenticate():
     return Response(
@@ -814,34 +821,34 @@ def index():
                 box-sizing: border-box;
             }
             .container {
-                max-width: 1200px;
+                max-width: 1400px;
                 margin: 0 auto;
                 display: grid;
-                grid-template-columns: 300px 1fr;
+                grid-template-columns: 320px 1fr;
                 gap: 2rem;
-            }
-            @media (max-width: 768px) {
-                .container { grid-template-columns: 1fr; }
             }
             .header {
                 grid-column: 1 / -1;
                 display: flex;
+                flex-wrap: wrap;
                 justify-content: space-between;
                 align-items: center;
                 border-bottom: 1px solid var(--card-border);
                 padding-bottom: 1rem;
                 margin-bottom: 1rem;
+                gap: 1rem;
             }
             h1 { margin: 0; font-weight: 600; font-size: 1.8rem; letter-spacing: -0.5px; display:flex; align-items:center; gap: 10px; }
             .status-badge {
                 background: rgba(35, 134, 54, 0.2);
                 color: #3fb950;
-                padding: 5px 12px;
+                padding: 6px 16px;
                 border-radius: 20px;
-                font-size: 0.85rem;
+                font-size: 0.9rem;
                 font-weight: 600;
                 border: 1px solid rgba(63, 185, 80, 0.4);
                 animation: pulse 2s infinite;
+                white-space: nowrap;
             }
             @keyframes pulse {
                 0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
@@ -850,70 +857,115 @@ def index():
             }
             .glass-panel {
                 background: var(--card-bg);
-                backdrop-filter: blur(12px);
-                -webkit-backdrop-filter: blur(12px);
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
                 border: 1px solid var(--card-border);
-                border-radius: 16px;
-                padding: 1.5rem;
+                border-radius: 20px;
+                padding: 1.8rem;
                 box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
                 margin-bottom: 1.5rem;
             }
             .stat-grid {
                 display: grid;
-                grid-template-columns: repeat(2, 1fr);
+                grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
                 gap: 1rem;
             }
             .stat-card {
                 background: rgba(255,255,255,0.03);
                 border-radius: 12px;
-                padding: 1rem;
+                padding: 1.2rem;
                 border: 1px solid rgba(255,255,255,0.05);
+                transition: transform 0.2s, background 0.2s;
             }
-            .stat-value { font-size: 2rem; font-weight: 600; color: var(--accent); margin-top: 5px;}
-            .stat-label { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px;}
+            .stat-card:hover {
+                transform: translateY(-2px);
+                background: rgba(255,255,255,0.06);
+            }
+            .stat-value { font-size: 2.2rem; font-weight: 600; color: var(--accent); margin-top: 5px; line-height: 1.2;}
+            .stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px;}
             
             #log-container {
                 background: #010409;
-                border-radius: 8px;
+                border-radius: 12px;
                 padding: 1rem;
-                height: 350px;
+                height: 400px;
                 overflow-y: auto;
-                font-family: 'Courier New', Courier, monospace;
+                font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
                 font-size: 0.9rem;
-                line-height: 1.5;
+                line-height: 1.6;
                 border: 1px solid #30363d;
                 scrollbar-width: thin;
                 scrollbar-color: #58a6ff #010409;
             }
-            .log-line { border-bottom: 1px solid rgba(255,255,255,0.05); padding: 4px 0; }
+            .log-line { border-bottom: 1px solid rgba(255,255,255,0.02); padding: 5px 0; }
             .log-time { color: var(--text-muted); margin-right: 15px; }
             .log-info { color: #8a2be2; }
             .log-warn { color: #d29922; }
             .log-err { color: var(--danger); }
             .log-success { color: #3fb950;}
 
-            .tabs { display: flex; gap: 10px; margin-bottom: 1rem; }
+            .tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; overflow-x: auto; padding-bottom: 5px; }
+            .tabs::-webkit-scrollbar { height: 4px; }
+            .tabs::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 4px; }
+            
             .tab-btn {
                 background: rgba(255,255,255,0.05); color: var(--text-main); border: 1px solid var(--card-border);
-                padding: 8px 16px; border-radius: 8px; cursor: pointer; font-family: 'Outfit'; transition: 0.2s;
+                padding: 10px 20px; border-radius: 10px; cursor: pointer; font-family: 'Outfit'; font-size: 1rem;
+                transition: all 0.2s ease; white-space: nowrap;
             }
-            .tab-btn.active { background: var(--accent); color: #000; font-weight: bold; border-color: var(--accent); }
-            .tab-content { display: none; }
+            .tab-btn:hover { background: rgba(255,255,255,0.1); }
+            .tab-btn.active { background: var(--accent); color: #000; font-weight: 600; border-color: var(--accent); box-shadow: 0 4px 15px rgba(88, 166, 255, 0.4);}
+            
+            .tab-content { display: none; animation: fadeIn 0.4s ease; }
             .tab-content.active { display: block; }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
             .input-group { margin-bottom: 1rem; }
             .input-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size:0.9rem; }
             .input-group input { 
-                width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--card-border); 
-                background: rgba(0,0,0,0.3); color: white; font-family: 'Outfit'; box-sizing: border-box;
+                width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--card-border); 
+                background: rgba(0,0,0,0.4); color: white; font-family: 'Outfit'; font-size: 1rem; box-sizing: border-box;
+                transition: border-color 0.2s;
             }
+            .input-group input:focus { border-color: var(--accent); outline: none; }
+            
             .btn {
-                background: var(--success); color: white; border: none; padding: 10px 20px;
-                border-radius: 6px; cursor: pointer; font-family: 'Outfit'; font-weight: 600;
+                background: var(--success); color: white; border: none; padding: 12px 24px; font-size: 1rem;
+                border-radius: 8px; cursor: pointer; font-family: 'Outfit'; font-weight: 600; transition: 0.2s; box-shadow: 0 4px 15px rgba(35, 134, 54, 0.3);
             }
-            .slot-row { display: flex; gap: 10px; margin-bottom: 10px; align-items:center; }
+            .btn:hover { background: #2ea043; transform: translateY(-1px); }
+            
+            .slot-row { display: flex; gap: 10px; margin-bottom: 15px; align-items:center; }
             .slot-row input { flex:1; }
-            .btn-danger { background: var(--danger); }
+            .btn-danger { background: var(--danger); box-shadow: 0 4px 15px rgba(218, 54, 51, 0.3); padding: 12px 16px;}
+            .btn-danger:hover { background: #f85149; }
+
+            /* Modern Mobile Responsiveness */
+            @media (max-width: 900px) {
+                .container { 
+                    grid-template-columns: 1fr; 
+                    padding: 1rem;
+                }
+                .sidebar { order: -1; } /* Bring stats to top on mobile */
+                .stat-grid {
+                    grid-template-columns: repeat(2, 1fr);
+                }
+                .stat-card[style*="grid-column"] { grid-column: 1 / -1 !important; }
+                
+                h1 { font-size: 1.5rem; }
+                .glass-panel { padding: 1.2rem; border-radius: 16px; }
+                .stat-value { font-size: 1.8rem; }
+                
+                #log-container { height: 350px; font-size: 0.8rem; }
+                .slot-row { flex-direction: column; align-items: stretch; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;}
+                .btn-danger { align-self: flex-end; width: 100%; }
+            }
+            
+            @media (max-width: 400px) {
+                .stat-grid { grid-template-columns: 1fr; }
+                .header { flex-direction: column; align-items: flex-start; }
+                .status-badge { align-self: flex-start; }
+            }
         </style>
     </head>
     <body>
@@ -1118,7 +1170,7 @@ def index():
 def api_stats():
     db = load_db()
     
-    uptime_delta = datetime.now() - GLOBAL_METRICS["start_time"]
+    uptime_delta = get_ist_now() - GLOBAL_METRICS["start_time"]
     hours, remainder = divmod(uptime_delta.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
     
@@ -1132,7 +1184,7 @@ def api_stats():
         "uptime": uptime_str,
         "polls": GLOBAL_METRICS["polls"],
         "latency": GLOBAL_METRICS["latency"],
-        "time": datetime.now().strftime("%I:%M:%S %p")
+        "time": f"{get_ist_now().strftime('%I:%M:%S %p')} IST"
     })
 
 @app.route("/api/history")

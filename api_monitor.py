@@ -837,6 +837,10 @@ def index():
         <script>
             function formatLog(line) {
                 if(!line) return '';
+                
+                // Completely hide dashboard API polling logs from the Web UI
+                if(line.includes("GET /api/")) return '';
+                
                 let formatted = line.replace(/</g, "&lt;").replace(/>/g, "&gt;");
                 
                 // Colorize based on keywords

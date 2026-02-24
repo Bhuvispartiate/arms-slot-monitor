@@ -21,9 +21,15 @@ import json
 import time
 import threading
 import logging
+import sqlite3
 from datetime import datetime
+import pytz
 from pathlib import Path
 from dotenv import load_dotenv
+import signal
+import sys
+import http.server
+import socketserver
 
 # Load secrets from .env file if present (Wispbyte / local dev)
 load_dotenv()
@@ -32,16 +38,12 @@ load_dotenv()
 #  CONFIGURATION
 # ─────────────────────────────────────────────────────
 
-# Slot IDs to monitor
-SLOT_IDS = [1, 2, 3, 4]
-SLOT_LABELS = {1: "A", 2: "B", 3: "C", 4: "D"}  # Human-friendly labels
-
 BASE_URL = (
     "https://arms.sse.saveetha.com/Handler/Student.ashx"
     "?Page=StudentInfobyId&Mode=GetCourseBySlot&Id={slot_id}"
 )
 
-# ARMS credentials for auto-login — set these as Railway environment variables
+# ARMS credentials for auto-login
 ARMS_USERNAME = os.environ.get("ARMS_USERNAME", "")   # ARMS username / roll number
 ARMS_PASSWORD = os.environ.get("ARMS_PASSWORD", "")   # ARMS password
 
@@ -68,9 +70,9 @@ HEADERS = {
 }
 
 # Seconds between slot polls
-POLL_INTERVAL = 15
+POLL_INTERVAL = 20
 
-# ── Telegram — set these as Railway environment variables ─────────────────────
+# ── Telegram ─────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -176,14 +178,76 @@ def auto_login() -> bool:
 # ─────────────────────────────────────────────────────
 
 def load_db() -> dict:
+    default_db = {
+        "approved": [], 
+        "pending": {},
+        "slots": [
+            {"id": 4, "label": "A"},
+            {"id": 5, "label": "B"},
+            {"id": 2, "label": "C"},
+            {"id": 7, "label": "D"}
+        ]
+    }
     if SUBSCRIBERS_FILE.exists():
-        return json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
-    return {"approved": [], "pending": {}}
+        try:
+            data = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
+            # Ensure new schema fields exist
+            if "slots" not in data:
+                data["slots"] = default_db["slots"]
+            return data
+        except json.JSONDecodeError:
+            pass
+    return default_db
+    
+# ─────────────────────────────────────────────────────
+#  ANALYTICS STORAGE (SQLite)
+# ─────────────────────────────────────────────────────
+
+def init_history_db():
+    conn = sqlite3.connect("history.db")
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            slot_id INTEGER,
+            course_count INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def log_history(slot_id: int, course_count: int):
+    try:
+        conn = sqlite3.connect("history.db")
+        c = conn.cursor()
+        c.execute("INSERT INTO history (slot_id, course_count) VALUES (?, ?)", (slot_id, course_count))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.error(f"  [DB] SQLite history logging failed: {e}")
+
+init_history_db()
 
 
 def save_db(db: dict) -> None:
     SUBSCRIBERS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
 
+# ─────────────────────────────────────────────────────
+#  GLOBAL METRICS & TIMEZONE
+# ─────────────────────────────────────────────────────
+
+IST = pytz.timezone('Asia/Kolkata')
+
+def get_ist_now():
+    return datetime.now(IST)
+
+GLOBAL_METRICS = {
+    "start_time": get_ist_now(),
+    "polls": 0,
+    "latency": "0.00s",
+    "total_courses": 0
+}
 
 # ─────────────────────────────────────────────────────
 #  TELEGRAM HELPERS
@@ -210,6 +274,34 @@ def broadcast(text: str) -> None:
     """Send a slot alert to the private channel."""
     log.info(f"  [Bot] Sending alert to channel {CHANNEL_CHAT_ID}…")
     send_message(CHANNEL_CHAT_ID, text)
+
+
+def set_bot_profile() -> None:
+    """Update the bot's Bio (short description) and About (description)."""
+    bio = "🚀 Instant real-time alerts for ARMS course slots. Never miss an opening! 🎓"
+    about = (
+        "ARMS Slot Monitor — The most reliable way to track course slot availability in real-time. ⚡\n\n"
+        "✅ Instant Telegram notifications\n"
+        "✅ 24/7 Slot Monitoring\n"
+        "✅ Secure & Multi-user\n\n"
+        "Monitoring slots so you don't have to! 🚀"
+    )
+
+    log.info("  [Bot] Updating bot profile (Bio/About)…")
+    
+    # 1. Set Short Description (Bio)
+    r_bio = tg_post("setMyShortDescription", short_description=bio)
+    if r_bio.get("ok"):
+        log.info("  [Bot] ✅ Bio updated successfully.")
+    else:
+        log.warning(f"  [Bot] ⚠ Bio update failed: {r_bio.get('description')}")
+
+    # 2. Set Description (About)
+    r_about = tg_post("setMyDescription", description=about)
+    if r_about.get("ok"):
+        log.info("  [Bot] ✅ About description updated successfully.")
+    else:
+        log.warning(f"  [Bot] ⚠ About description update failed: {r_about.get('description')}")
 
 
 # ─────────────────────────────────────────────────────
@@ -537,77 +629,676 @@ def summarise(courses: list[dict]) -> str:
 
 def monitor_thread():
     log.info("  [Monitor] Starting slot monitor…")
+    global _last_alert
+    
+    # Store known counts per slot
     baselines: dict[int, dict] = {}
-    poll = 0
 
     while True:
-        poll += 1
-        log.info(f"\n[Poll #{poll:04d}]  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        db = load_db()
+        active_slots = db.get("slots", [])
+        
+        GLOBAL_METRICS["polls"] += 1
+        log.info(f"\n[Poll #{GLOBAL_METRICS['polls']:04d}]  {get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
 
-        for slot_id in SLOT_IDS:
-            courses = fetch_courses(slot_id)
-            if courses is None:
-                log.warning(f"  [Slot {slot_id}] ⚠  No response, skipping.")
-                continue
+        cycle_courses_count = 0
+        cycle_start_t = time.time()
 
-            current_count = len(courses)
+        for slot_data in active_slots:
+            try:
+                slot_id = slot_data["id"]
+                slot_label = slot_data["label"]
+                
+                t0 = time.time()
+                courses = fetch_courses(slot_id)
+                t1 = time.time()
+                
+                if courses is None:
+                    log.warning(f"  [Slot {slot_label}] ⚠  No response, skipping.")
+                    continue
 
-            if slot_id not in baselines:
-                log.info(f"  [Slot {slot_id}] ✅ Baseline: {current_count} courses.")
-                baselines[slot_id] = {"count": current_count, "courses": courses}
-                continue
+                log.info(f"  [API] Slot {slot_label} fetched in {(t1-t0):.2f}s")
+                current_count = len(courses)
+                cycle_courses_count += current_count
+                
+                log_history(slot_id, current_count)
 
-            prev_count   = baselines[slot_id]["count"]
-            prev_courses = baselines[slot_id]["courses"]
+                if slot_id not in baselines:
+                    log.info(f"  [Slot {slot_label}] ✅ Baseline: {current_count} courses.")
+                    baselines[slot_id] = {"count": current_count, "courses": courses}
+                    continue
 
-            if current_count != prev_count:
-                # Always update baseline silently
-                baselines[slot_id] = {"count": current_count, "courses": courses}
-                with open(f"latest_slot{slot_id}.json", "w", encoding="utf-8") as f:
-                    json.dump(courses, f, indent=2, ensure_ascii=False)
+                prev_count   = baselines[slot_id]["count"]
+                prev_courses = baselines[slot_id]["courses"]
 
-            if current_count > prev_count:
-                # Only notify on INCREASE
-                delta = current_count - prev_count
+                if current_count != prev_count:
+                    # Update baseline and file only when data actually changes
+                    baselines[slot_id] = {"count": current_count, "courses": courses}
+                    with open(f"latest_slot{slot_id}.json", "w", encoding="utf-8") as f:
+                        json.dump(courses, f, indent=2, ensure_ascii=False)
 
-                log.info(f"  [Slot {slot_id}] 🔔 COUNT INCREASED: {prev_count} → {current_count} (+{delta})")
+                    if current_count > prev_count:
+                        # Only notify on INCREASE
+                        delta = current_count - prev_count
 
-                prev_ids = {c["SubjectId"]: c for c in prev_courses}
-                curr_ids = {c["SubjectId"]: c for c in courses}
+                        log.info(f"  [Slot {slot_label}] 🔔 COUNT INCREASED: {prev_count} → {current_count} (+{delta})")
 
-                added_lines = []
-                for sid, c in curr_ids.items():
-                    if sid not in prev_ids:
-                        added_lines.append(f"  ➕ {c['SubjectCode']} – {c['SubjectName']} ({c['AvailableCount']} slots)")
+                        prev_ids = {c["SubjectId"]: c for c in prev_courses}
+                        curr_ids = {c["SubjectId"]: c for c in courses}
 
-                # Build Telegram message
-                label = SLOT_LABELS.get(slot_id, str(slot_id))
-                tg = [f"<b>🔔 ARMS Slot {label}: New Course Added! ▲</b>",
-                      f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
-                if added_lines:
-                    tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
-                tg.append(f"\n🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>")
-                tg_text = "\n".join(tg)
+                        added_lines = []
+                        for sid, c in curr_ids.items():
+                            if sid not in prev_ids:
+                                added_lines.append(f"  ➕ {c['SubjectCode']} – {c['SubjectName']} ({c['AvailableCount']} slots)")
 
-                broadcast(tg_text)
-                send_message(ADMIN_CHAT_ID, tg_text)
+                        # Build Telegram message
+                        tg = [f"<b>🔔 ARMS Slot {slot_label}: New Course Added! ▲</b>",
+                              f"Courses: <b>{prev_count} → {current_count}</b>  (+{delta})"]
+                        if added_lines:
+                            tg.append("\n<b>Added:</b>\n" + "\n".join(added_lines))
+                        tg.append(f"\n🕐 <i>{get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p IST')}</i>")
+                        tg_text = "\n".join(tg)
 
-            elif current_count < prev_count:
-                log.info(f"  [Slot {slot_id}] 📉 Count decreased {prev_count}→{current_count} (no notification sent)")
-            else:
-                log.info(f"  [Slot {slot_id}] ✅ No change. ({current_count} courses)")
+                        # Broadcast to all approved subscribers
+                        db = load_db()
+                        u_list = db.get("approved", [])
+                        msg = {"chat_id": 0, "text": tg_text, "parse_mode": "HTML"}
+                        
+                        log.info(f"  [Slot {slot_label}] Broadcasting alert to {len(u_list)} users.")
+                        for u_id in u_list:
+                            msg["chat_id"] = u_id
+                            tg_post("sendMessage", **msg)
+                        
+                        # Also send separately to admin
+                        send_message(ADMIN_CHAT_ID, tg_text)
 
+                    elif current_count < prev_count:
+                        log.info(f"  [Slot {slot_id}] 📉 Count decreased {prev_count}→{current_count} (no notification sent)")
+                    else:
+                        pass  # Reduced logging: only log on changes
+
+            except Exception as e:
+                log.error(f"  [Slot {slot_label}] ❌ Error processing courses: {e}")
+        
+        cycle_end_t = time.time()
+        GLOBAL_METRICS["latency"] = f"{(cycle_end_t - cycle_start_t):.2f}s"
+        GLOBAL_METRICS["total_courses"] = cycle_courses_count
+
+        # Sleep before next poll
         time.sleep(POLL_INTERVAL)
+
+
+# ─────────────────────────────────────────────────────
+#  SHUTDOWN HANDLER
+# ─────────────────────────────────────────────────────
+
+def handle_shutdown(signum=None, frame=None):
+    """Notify admin and exit gracefully on shutdown signals."""
+    sig_name = signal.Signals(signum).name if signum else "Manual"
+    log.info(f"\n[System] 🛑 Shutdown signal ({sig_name}) received. Notifying admin…")
+    try:
+        send_message(
+            ADMIN_CHAT_ID,
+            "🛑 <b>ARMS Monitor — Server Powering Down</b>\n\n"
+            "The bot process is stopping or the server is restarting.\n"
+            "Monitoring will be paused until the service is back online.\n\n"
+            f"🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+        )
+    except Exception as e:
+        log.error(f"  [System] Failed to send shutdown message: {e}")
+    
+    log.info("Goodbye!")
+    os._exit(0)  # Kill all threads and exit immediately
 
 
 # ─────────────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────
+#  FLASK WEB DASHBOARD & API
+# ─────────────────────────────────────────────────────
+from flask import Flask, request, jsonify, Response
+from functools import wraps
+import pytz # Added pytz import
+
+app = Flask(__name__)
+
+# Basic Authentication wrapper
+def check_auth(username, password):
+    env_user = os.environ.get("DASHBOARD_USER", "KnightWinner")
+    env_pass = os.environ.get("DASHBOARD_PASS", "9360406137")
+    return username == env_user and password == env_pass
+
+def authenticate():
+    return Response(
+    'Could not verify your access level for that URL.\n'
+    'You have to login with proper credentials', 401,
+    {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+def requires_auth(f):
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    decorated.__name__ = f.__name__
+    return decorated
+
+@app.route("/")
+@requires_auth
+def index():
+    # Return a premium Glassmorphism React/Vanilla-JS Dashboard
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>ARMS Monitor Control Panel</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+            :root {
+                --bg-color: #0d1117;
+                --card-bg: rgba(22, 27, 34, 0.6);
+                --card-border: rgba(255, 255, 255, 0.1);
+                --text-main: #c9d1d9;
+                --text-muted: #8b949e;
+                --accent: #58a6ff;
+                --success: #238636;
+                --danger: #da3633;
+            }
+            body {
+                background-color: var(--bg-color);
+                background-image: radial-gradient(circle at 15% 50%, rgba(88, 166, 255, 0.15), transparent 25%),
+                                  radial-gradient(circle at 85% 30%, rgba(35, 134, 54, 0.15), transparent 25%);
+                color: var(--text-main);
+                font-family: 'Outfit', sans-serif;
+                margin: 0;
+                padding: 2rem;
+                min-height: 100vh;
+                box-sizing: border-box;
+            }
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: 320px 1fr;
+                gap: 2rem;
+            }
+            .header {
+                grid-column: 1 / -1;
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid var(--card-border);
+                padding-bottom: 1rem;
+                margin-bottom: 1rem;
+                gap: 1rem;
+            }
+            h1 { margin: 0; font-weight: 600; font-size: 1.8rem; letter-spacing: -0.5px; display:flex; align-items:center; gap: 10px; }
+            .status-badge {
+                background: rgba(35, 134, 54, 0.2);
+                color: #3fb950;
+                padding: 6px 16px;
+                border-radius: 20px;
+                font-size: 0.9rem;
+                font-weight: 600;
+                border: 1px solid rgba(63, 185, 80, 0.4);
+                animation: pulse 2s infinite;
+                white-space: nowrap;
+            }
+            @keyframes pulse {
+                0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
+                70% { box-shadow: 0 0 0 10px rgba(63, 185, 80, 0); }
+                100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
+            }
+            .glass-panel {
+                background: var(--card-bg);
+                backdrop-filter: blur(16px);
+                -webkit-backdrop-filter: blur(16px);
+                border: 1px solid var(--card-border);
+                border-radius: 20px;
+                padding: 1.8rem;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+                margin-bottom: 1.5rem;
+            }
+            .stat-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+                gap: 1rem;
+            }
+            .stat-card {
+                background: rgba(255,255,255,0.03);
+                border-radius: 12px;
+                padding: 1.2rem;
+                border: 1px solid rgba(255,255,255,0.05);
+                transition: transform 0.2s, background 0.2s;
+            }
+            .stat-card:hover {
+                transform: translateY(-2px);
+                background: rgba(255,255,255,0.06);
+            }
+            .stat-value { font-size: 2.2rem; font-weight: 600; color: var(--accent); margin-top: 5px; line-height: 1.2;}
+            .stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px;}
+            
+            #log-container {
+                background: #010409;
+                border-radius: 12px;
+                padding: 1rem;
+                height: 400px;
+                overflow-y: auto;
+                font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
+                font-size: 0.9rem;
+                line-height: 1.6;
+                border: 1px solid #30363d;
+                scrollbar-width: thin;
+                scrollbar-color: #58a6ff #010409;
+            }
+            .log-line { border-bottom: 1px solid rgba(255,255,255,0.02); padding: 5px 0; }
+            .log-time { color: var(--text-muted); margin-right: 15px; }
+            .log-info { color: #8a2be2; }
+            .log-warn { color: #d29922; }
+            .log-err { color: var(--danger); }
+            .log-success { color: #3fb950;}
+
+            .tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; overflow-x: auto; padding-bottom: 5px; }
+            .tabs::-webkit-scrollbar { height: 4px; }
+            .tabs::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 4px; }
+            
+            .tab-btn {
+                background: rgba(255,255,255,0.05); color: var(--text-main); border: 1px solid var(--card-border);
+                padding: 10px 20px; border-radius: 10px; cursor: pointer; font-family: 'Outfit'; font-size: 1rem;
+                transition: all 0.2s ease; white-space: nowrap;
+            }
+            .tab-btn:hover { background: rgba(255,255,255,0.1); }
+            .tab-btn.active { background: var(--accent); color: #000; font-weight: 600; border-color: var(--accent); box-shadow: 0 4px 15px rgba(88, 166, 255, 0.4);}
+            
+            .tab-content { display: none; animation: fadeIn 0.4s ease; }
+            .tab-content.active { display: block; }
+            @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+            .input-group { margin-bottom: 1rem; }
+            .input-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size:0.9rem; }
+            .input-group input { 
+                width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--card-border); 
+                background: rgba(0,0,0,0.4); color: white; font-family: 'Outfit'; font-size: 1rem; box-sizing: border-box;
+                transition: border-color 0.2s;
+            }
+            .input-group input:focus { border-color: var(--accent); outline: none; }
+            
+            .btn {
+                background: var(--success); color: white; border: none; padding: 12px 24px; font-size: 1rem;
+                border-radius: 8px; cursor: pointer; font-family: 'Outfit'; font-weight: 600; transition: 0.2s; box-shadow: 0 4px 15px rgba(35, 134, 54, 0.3);
+            }
+            .btn:hover { background: #2ea043; transform: translateY(-1px); }
+            
+            .slot-row { display: flex; gap: 10px; margin-bottom: 15px; align-items:center; }
+            .slot-row input { flex:1; }
+            .btn-danger { background: var(--danger); box-shadow: 0 4px 15px rgba(218, 54, 51, 0.3); padding: 12px 16px;}
+            .btn-danger:hover { background: #f85149; }
+
+            /* Modern Mobile Responsiveness */
+            @media (max-width: 900px) {
+                body { padding: 1rem; }
+                .container { 
+                    grid-template-columns: 1fr; 
+                    gap: 1.5rem;
+                }
+                .sidebar { order: -1; } /* Bring stats to top on mobile */
+                .stat-grid { grid-template-columns: repeat(2, 1fr); }
+                .stat-card[style*="grid-column"] { grid-column: 1 / -1 !important; }
+                h1 { font-size: 1.5rem; }
+            }
+            
+            @media (max-width: 600px) {
+                body { padding: 0.5rem; }
+                .container { gap: 1rem; }
+                .glass-panel { padding: 1.2rem; border-radius: 16px; margin-bottom: 1rem; }
+                .stat-grid { gap: 0.8rem; }
+                .stat-card { padding: 1rem; }
+                .stat-value { font-size: 1.6rem; }
+                .stat-label { font-size: 0.75rem; }
+                
+                .header { flex-direction: column; align-items: flex-start; gap: 0.8rem; }
+                .status-badge { align-self: flex-start; font-size: 0.8rem; padding: 4px 12px; }
+                
+                #log-container { height: 300px; font-size: 0.8rem; padding: 0.8rem; }
+                .slot-row { flex-direction: column; align-items: stretch; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;}
+                .btn-danger { width: 100%; margin-top: 5px; }
+                .tab-btn { padding: 8px 16px; font-size: 0.9rem; }
+            }
+            
+            @media (max-width: 400px) {
+                .stat-grid { grid-template-columns: 1fr; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🎓 ARMS Slot Monitor</h1>
+                <div class="status-badge">● SYSTEM ONLINE</div>
+            </div>
+            
+            <div class="sidebar">
+                <div class="glass-panel stat-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Subscribers</div>
+                        <div class="stat-value" id="sub-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Monitored Slots</div>
+                        <div class="stat-value" id="slot-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Courses</div>
+                        <div class="stat-value" id="course-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">System Uptime</div>
+                        <div class="stat-value" style="font-size:1.4rem;" id="uptime">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Total Polls</div>
+                        <div class="stat-value" id="poll-count">--</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">API Latency</div>
+                        <div class="stat-value" id="api-latency">--</div>
+                    </div>
+                    <div class="stat-card" style="grid-column: 1 / -1;">
+                        <div class="stat-label">Last Poll Update</div>
+                        <div class="stat-value" style="font-size:1.2rem; color:#c9d1d9;" id="last-poll">Waiting...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="main-content">
+                <div class="tabs">
+                    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
+                    <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
+                </div>
+
+                <div id="tab-overview" class="tab-content active">
+                    <div class="glass-panel">
+                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Analytics History (24h)</h2>
+                        <div style="height: 250px; width: 100%;">
+                            <canvas id="analyticsChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel">
+                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Live Terminal Logs</h2>
+                        <div id="log-container">Loading system logs...</div>
+                    </div>
+                </div>
+
+                <div id="tab-settings" class="tab-content glass-panel">
+                    <h2 style="margin-top:0;">Slot Configuration</h2>
+                    <p style="color:var(--text-muted); font-size:0.9rem;">Change which ARMS slots are actively monitored. The background bot updates instantly upon save.</p>
+                    
+                    <div id="slots-editor"></div>
+                    
+                    <button class="tab-btn" onclick="addSlotRow()" style="margin-top:10px;">+ Add Slot</button>
+                    <br><br>
+                    <button class="btn" onclick="saveSlots()">💾 Save Configuration</button>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            let chartInstance = null;
+
+            function switchTab(tabId) {
+                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+                document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+                document.getElementById('tab-' + tabId).classList.add('active');
+                event.target.classList.add('active');
+                if(tabId === 'settings') loadSettings();
+            }
+
+            function formatLog(line) {
+                if(!line) return '';
+                if(line.includes("GET /api/")) return ''; // Hide dashboard noise
+                let formatted = line.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                if(formatted.includes("[Bot]") || formatted.includes("[Monitor]")) formatted = `<span class="log-info">${formatted}</span>`;
+                if(formatted.includes("⚠") || formatted.includes("WARNING")) formatted = `<span class="log-warn">${formatted}</span>`;
+                if(formatted.includes("❌") || formatted.includes("ERROR")) formatted = `<span class="log-err">${formatted}</span>`;
+                if(formatted.includes("✅") || formatted.includes("started") || formatted.includes("INCREASED")) formatted = `<span class="log-success">${formatted}</span>`;
+                const timeMatch = formatted.match(/^(\\d{2}:\\d{2}:\\d{2})\\s+(.*)/);
+                if(timeMatch) return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
+                return `<div class="log-line">${formatted}</div>`;
+            }
+
+            async function updateDashboard() {
+                try {
+                    const statsRes = await fetch('/api/stats');
+                    const stats = await statsRes.json();
+                    document.getElementById('sub-count').innerText = stats.subscribers;
+                    document.getElementById('slot-count').innerText = stats.slots;
+                    document.getElementById('course-count').innerText = stats.total_courses;
+                    document.getElementById('uptime').innerText = stats.uptime;
+                    document.getElementById('poll-count').innerText = stats.polls;
+                    document.getElementById('api-latency').innerText = stats.latency;
+                    document.getElementById('last-poll').innerText = stats.time;
+
+                    const logsRes = await fetch('/api/logs');
+                    const logsData = await logsRes.json();
+                    const logContainer = document.getElementById('log-container');
+                    const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 50;
+                    logContainer.innerHTML = logsData.logs.map(formatLog).join('');
+                    if(isScrolledToBottom) logContainer.scrollTop = logContainer.scrollHeight;
+
+                    // Fetch chart history
+                    const histRes = await fetch('/api/history');
+                    updateChart(await histRes.json());
+                } catch(e) { console.error("Update failed", e); }
+            }
+
+            function updateChart(data) {
+                const ctx = document.getElementById('analyticsChart').getContext('2d');
+                if(!chartInstance) {
+                    chartInstance = new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: data.labels,
+                            datasets: data.datasets
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            animation: false,
+                            scales: {
+                                y: { beginAtZero: false, grid: {color: 'rgba(255,255,255,0.05)'}, ticks: {color: '#8b949e'} },
+                                x: { grid: {display: false}, ticks: {color: '#8b949e', maxTicksLimit: 10} }
+                            },
+                            plugins: {
+                                legend: { labels: { color: '#c9d1d9' } }
+                            }
+                        }
+                    });
+                } else {
+                    chartInstance.data.labels = data.labels;
+                    chartInstance.data.datasets = data.datasets;
+                    chartInstance.update();
+                }
+            }
+
+            // --- Settings Editor Logic ---
+            async function loadSettings() {
+                const res = await fetch('/api/settings');
+                const data = await res.json();
+                const container = document.getElementById('slots-editor');
+                container.innerHTML = '';
+                data.slots.forEach(s => addSlotRow(s.id, s.label));
+            }
+
+            function addSlotRow(id = '', label = '') {
+                const row = document.createElement('div');
+                row.className = 'slot-row';
+                row.innerHTML = `
+                    <input type="number" placeholder="Slot ID (e.g. 1)" value="${id}" class="s-id">
+                    <input type="text" placeholder="Label (e.g. A-1)" value="${label}" class="s-label">
+                    <button class="btn btn-danger" onclick="this.parentElement.remove()">X</button>
+                `;
+                document.getElementById('slots-editor').appendChild(row);
+            }
+
+            async function saveSlots() {
+                const rows = document.querySelectorAll('.slot-row');
+                const newSlots = [];
+                rows.forEach(r => {
+                    const id = parseInt(r.querySelector('.s-id').value);
+                    const label = r.querySelector('.s-label').value;
+                    if(!isNaN(id) && label) newSlots.push({id, label});
+                });
+                
+                await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({slots: newSlots})
+                });
+                alert('Saved! The bot will use these slots on its next poll.');
+            }
+
+            // Init loop
+            updateDashboard();
+            setInterval(updateDashboard, 5000);
+        </script>
+    </body>
+    </html>
+    """
+    return html
+
+@app.route("/api/stats")
+@requires_auth
+def api_stats():
+    db = load_db()
+    
+    uptime_delta = get_ist_now() - GLOBAL_METRICS["start_time"]
+    hours, remainder = divmod(uptime_delta.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    # Calculate days cleanly if available
+    uptime_str = f"{uptime_delta.days}d {hours}h {minutes}m" if uptime_delta.days > 0 else f"{hours}h {minutes}m"
+    
+    return jsonify({
+        "subscribers": len(db.get("approved", [])),
+        "slots": len(db.get("slots", [])),
+        "total_courses": GLOBAL_METRICS["total_courses"],
+        "uptime": uptime_str,
+        "polls": GLOBAL_METRICS["polls"],
+        "latency": GLOBAL_METRICS["latency"],
+        "time": f"{get_ist_now().strftime('%I:%M:%S %p')} IST"
+    })
+
+@app.route("/api/history")
+@requires_auth
+def api_history():
+    # Provide Chart.js formatting from SQLite History
+    db = load_db()
+    active_slots = db.get("slots", [])
+    
+    conn = sqlite3.connect("history.db")
+    c = conn.cursor()
+    # Fetch last 50 distinct timestamps
+    c.execute("SELECT DISTINCT timestamp FROM history ORDER BY timestamp DESC LIMIT 50")
+    times = [r[0] for r in c.fetchall()][::-1] 
+    
+    datasets = []
+    colors = ['#58a6ff', '#238636', '#d29922', '#8a2be2', '#da3633']
+    
+    for idx, slot in enumerate(active_slots):
+        sid = slot["id"]
+        color = colors[idx % len(colors)]
+        
+        c.execute("SELECT timestamp, course_count FROM history WHERE slot_id = ? ORDER BY timestamp DESC LIMIT 50", (sid,))
+        # Map out the values against the standard times
+        raw_data = {r[0]: r[1] for r in c.fetchall()}
+        
+        data_points = []
+        last_val = 0
+        for t in times:
+            if t in raw_data:
+                last_val = raw_data[t]
+            data_points.append(last_val)
+            
+        datasets.append({
+            "label": f"Slot {slot['label']} ({sid})",
+            "data": data_points,
+            "borderColor": color,
+            "backgroundColor": color + "33",
+            "borderWidth": 2,
+            "pointRadius": 0,
+            "fill": True,
+            "tension": 0.4
+        })
+    conn.close()
+    
+    # Format labels cleanly (HH:MM)
+    clean_labels = [datetime.strptime(t, "%Y-%m-%d %H:%M:%S").strftime("%H:%M") for t in times]
+    return jsonify({"labels": clean_labels, "datasets": datasets})
+
+@app.route("/api/settings", methods=["GET", "POST"])
+@requires_auth
+def api_settings():
+    db = load_db()
+    if request.method == "POST":
+        data = request.json
+        if "slots" in data:
+            db["slots"] = data["slots"]
+            save_db(db)
+            return jsonify({"status": "success"})
+    return jsonify({"slots": db.get("slots", [])})
+
+@app.route("/api/logs")
+@requires_auth
+def api_logs():
+    try:
+        # Read last 150 lines efficiently
+        with open("slot_monitor.log", "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            return jsonify({"logs": lines[-150:]})
+    except Exception as e:
+        return jsonify({"logs": [f"Error reading logs: {e}"]})
+
+def flask_server():
+    import werkzeug.serving
+    import logging
+    
+    # Force Werkzeug logger to be quiet
+    log_werkzeug = logging.getLogger('werkzeug')
+    log_werkzeug.setLevel(logging.ERROR)
+    log_werkzeug.disabled = True
+
+    # Custom handler to completely suppress request logging
+    class NoLogRequestHandler(werkzeug.serving.WSGIRequestHandler):
+        def log_request(self, code='-', size='-'):
+            pass
+        def log(self, type, message, *args):
+            pass
+
+    port = int(os.environ.get("PORT", 8100))
+    ip_addr = os.environ.get("IP", "::")
+    log.info(f"  [Web] Attempting to start Flask WSGI on {ip_addr}:{port} (Silent HTTP mode)")
+    werkzeug.serving.run_simple(
+        ip_addr, port, app,
+        use_reloader=False, 
+        use_debugger=False,
+        request_handler=NoLogRequestHandler
+    )
+
 if __name__ == "__main__":
+    db_init = load_db()
+    active_slots_init = db_init.get("slots", [])
+    slot_ids_init = [s["id"] for s in active_slots_init]
+    
     log.info("=" * 60)
     log.info("  ARMS Slot Monitor  –  Multi-User Bot Service")
-    log.info(f"  Admin : {ADMIN_CHAT_ID}  |  Slots: {SLOT_IDS}")
+    log.info(f"  Admin : {ADMIN_CHAT_ID}  |  Slots: {slot_ids_init}")
     log.info("=" * 60)
 
     # Ensure subscribers file exists
@@ -621,31 +1312,34 @@ if __name__ == "__main__":
     else:
         log.info("  [Login] Running with hardcoded session cookie (no credentials set).")
 
+    # Update bot profile (Bio/About)
+    set_bot_profile()
+
     # Startup message to admin
+    slot_labels_str = ", ".join(s["label"] for s in active_slots_init) if active_slots_init else "None"
     send_message(
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"
-        "Slot alerts → private channel 🔔\n"
-        "/setcookie &lt;value&gt; – update session cookie live\n\n"
-        f"Watching Slots: {SLOT_IDS}",
+        f"👁 Watching Slots: <b>{slot_labels_str}</b>\n"
+        f"⏱ Poll Interval: every <b>{POLL_INTERVAL}s</b>\n"
+        "/setcookie &lt;value&gt; – update session cookie live",
     )
 
-    # Notify the channel that monitoring has started
-    slot_labels_str = ", ".join(SLOT_LABELS[s] for s in SLOT_IDS)
-    send_message(
-        CHANNEL_CHAT_ID,
-        "🟢 <b>ARMS Slot Monitor — Started!</b>\n\n"
-        f"👁 Watching Slots: <b>{slot_labels_str}</b>\n"
-        f"⏱ Poll Interval: every <b>{POLL_INTERVAL}s</b>\n\n"
-        "You'll be notified here the moment a new course slot opens. 🔔",
-    )
+    # Start Flask Web Dashboard in background thread for Alwaysdata HTTP
+    t_web = threading.Thread(target=flask_server, daemon=True, name="WebThread")
+    t_web.start()
 
     # Start bot in background thread
     t_bot = threading.Thread(target=bot_thread, daemon=True, name="BotThread")
     t_bot.start()
 
+    # Register shutdown signals (SIGINT for Ctrl+C, SIGTERM for cloud restarts)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+
     # Run monitor on main thread
     try:
         monitor_thread()
-    except KeyboardInterrupt:
-        log.info("\n\nShutting down. Goodbye!")
+    except Exception as e:
+        log.error(f"CRITICAL ERROR in Monitor Thread: {e}")
+        handle_shutdown()

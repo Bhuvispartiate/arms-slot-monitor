@@ -699,18 +699,9 @@ def monitor_thread():
                         tg.append(f"\n🕐 <i>{get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p IST')}</i>")
                         tg_text = "\n".join(tg)
 
-                        # Broadcast to all approved subscribers
-                        db = load_db()
-                        u_list = db.get("approved", [])
-                        msg = {"chat_id": 0, "text": tg_text, "parse_mode": "HTML"}
-                        
-                        log.info(f"  [Slot {slot_label}] Broadcasting alert to {len(u_list)} users.")
-                        for u_id in u_list:
-                            msg["chat_id"] = u_id
-                            tg_post("sendMessage", **msg)
-                        
-                        # Also send separately to admin
+                        # Send to Admin and Channel only
                         send_message(ADMIN_CHAT_ID, tg_text)
+                        broadcast(tg_text)
 
                     elif current_count < prev_count:
                         log.info(f"  [Slot {slot_id}] 📉 Count decreased {prev_count}→{current_count} (no notification sent)")
@@ -734,21 +725,26 @@ def monitor_thread():
 
 def handle_shutdown(signum=None, frame=None):
     """Notify admin and exit gracefully on shutdown signals."""
-    sig_name = signal.Signals(signum).name if signum else "Manual"
+    sig_name = signal.Signals(signum).name if signum else "Manual shutdown"
+    reason_map = {
+        "SIGINT":  "Ctrl+C pressed / manual stop",
+        "SIGTERM": "Server terminated (platform restart or deploy)",
+        "Manual shutdown": "Unhandled exception in monitor thread",
+    }
+    reason = reason_map.get(sig_name, f"Signal: {sig_name}")
     log.info(f"\n[System] 🛑 Shutdown signal ({sig_name}) received. Notifying admin…")
     try:
         send_message(
             ADMIN_CHAT_ID,
             "🛑 <b>ARMS Monitor — Server Powering Down</b>\n\n"
-            "The bot process is stopping or the server is restarting.\n"
-            "Monitoring will be paused until the service is back online.\n\n"
-            f"🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</i>"
+            f"📌 <b>Reason:</b> {reason}\n\n"
+            "Monitoring will be paused until the service is back online.\n"
+            f"🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}</i>"
         )
     except Exception as e:
         log.error(f"  [System] Failed to send shutdown message: {e}")
-    
     log.info("Goodbye!")
-    os._exit(0)  # Kill all threads and exit immediately
+    os._exit(0)
 
 
 # ─────────────────────────────────────────────────────
@@ -764,26 +760,10 @@ import pytz # Added pytz import
 
 app = Flask(__name__)
 
-# Basic Authentication wrapper
-def check_auth(username, password):
-    env_user = os.environ.get("DASHBOARD_USER", "KnightWinner")
-    env_pass = os.environ.get("DASHBOARD_PASS", "9360406137")
-    return username == env_user and password == env_pass
-
-def authenticate():
-    return Response(
-    'Could not verify your access level for that URL.\n'
-    'You have to login with proper credentials', 401,
-    {'WWW-Authenticate': 'Basic realm="Login Required"'})
-
+# Authentication removed — dashboard is open access
 def requires_auth(f):
-    def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return authenticate()
-        return f(*args, **kwargs)
-    decorated.__name__ = f.__name__
-    return decorated
+    f.__name__ = f.__name__
+    return f
 
 @app.route("/")
 @requires_auth
@@ -1317,12 +1297,14 @@ if __name__ == "__main__":
 
     # Startup message to admin
     slot_labels_str = ", ".join(s["label"] for s in active_slots_init) if active_slots_init else "None"
+    # Startup message to admin
+    slot_labels_str = ", ".join(s["label"] for s in active_slots_init) if active_slots_init else "None"
     send_message(
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"
         f"👁 Watching Slots: <b>{slot_labels_str}</b>\n"
         f"⏱ Poll Interval: every <b>{POLL_INTERVAL}s</b>\n"
-        "/setcookie &lt;value&gt; – update session cookie live",
+        "/setcookie &lt;value&gt; – update session cookie live"
     )
 
     # Start Flask Web Dashboard in background thread for Alwaysdata HTTP

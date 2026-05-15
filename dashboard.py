@@ -6,9 +6,6 @@ from pathlib import Path
 from flask import Flask, request, jsonify, Response
 from functools import wraps
 import pytz
-from dotenv import load_dotenv
-
-load_dotenv()
 
 SUBSCRIBERS_FILE = Path("subscribers.json")
 METRICS_FILE = Path("metrics.json")

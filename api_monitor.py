@@ -32,17 +32,28 @@ import http.server
 import socketserver
 
 # ─────────────────────────────────────────────────────
-#  CONFIGURATION
+#  CONFIGURATION & STORAGE
 # ─────────────────────────────────────────────────────
+
+CONFIG_FILE = Path("config.json")
+
+def load_config():
+    default = {"arms_username": "P192512045", "arms_password": "welcome", "poll_interval": 20}
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(json.dumps(default, indent=2))
+        return default
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except:
+        return default
+
+# Initial load
+CONFIG = load_config()
 
 BASE_URL = (
     "https://arms.sse.saveetha.com/Handler/Student.ashx"
     "?Page=StudentInfobyId&Mode=GetCourseBySlot&Id={slot_id}"
 )
-
-# ARMS credentials for auto-login (hardcoded)
-ARMS_USERNAME = "P192512045"   # ARMS username / roll number
-ARMS_PASSWORD = "welcome"      # ARMS password
 
 ARMS_LOGIN_URL = "https://arms.sse.saveetha.com/Login.aspx?s=exp"
 
@@ -103,12 +114,14 @@ log = logging.getLogger(__name__)
 
 def auto_login() -> bool:
     """
-    Log into ARMS with ARMS_USERNAME / ARMS_PASSWORD and update
+    Log into ARMS with credentials from CONFIG and update
     COOKIES with the fresh ASP.NET_SessionId.
-    Returns True on success, False on failure.
     """
-    if not ARMS_USERNAME or not ARMS_PASSWORD:
-        log.warning("  [Login] No credentials set — skipping auto-login.")
+    username = CONFIG.get("arms_username")
+    password = CONFIG.get("arms_password")
+    
+    if not username or not password:
+        log.warning("  [Login] No credentials in config — skipping auto-login.")
         return False
 
     max_retries = 3
@@ -135,8 +148,8 @@ def auto_login() -> bool:
                 "__VIEWSTATE":          viewstate,
                 "__VIEWSTATEGENERATOR": vsgenerator,
                 "__EVENTVALIDATION":    eventvalidation,
-                "txtusername":          ARMS_USERNAME,
-                "txtpassword":          ARMS_PASSWORD,
+                "txtusername":          username,
+                "txtpassword":          password,
                 "btnlogin":             "Login",
             }
             resp = s.post(ARMS_LOGIN_URL, data=payload, timeout=30, allow_redirects=True)
@@ -688,12 +701,16 @@ def get_faculty_name(course: dict) -> str:
 
 def monitor_thread():
     log.info("  [Monitor] Starting slot monitor…")
-    global _last_alert
+    global _last_alert, CONFIG
     
     # Store known counts per slot
     baselines: dict[int, dict] = {}
 
     while True:
+        # Reload configuration
+        CONFIG = load_config()
+        poll_interval = CONFIG.get("poll_interval", 20)
+        
         db = load_db()
         active_slots = db.get("slots", [])
         
@@ -793,7 +810,7 @@ def monitor_thread():
             log.error(f"  [Metrics] Failed to save metrics: {e}")
 
         # Sleep before next poll
-        time.sleep(POLL_INTERVAL)
+        time.sleep(poll_interval)
 
 
 # ─────────────────────────────────────────────────────
@@ -845,10 +862,10 @@ if __name__ == "__main__":
         log.info("  Created subscribers.json")
 
     # Auto-login to get a fresh session cookie
-    if ARMS_USERNAME and ARMS_PASSWORD:
+    if CONFIG.get("arms_username") and CONFIG.get("arms_password"):
         auto_login()
     else:
-        log.info("  [Login] Running with hardcoded session cookie (no credentials set).")
+        log.info("  [Login] Running with hardcoded session cookie (no credentials in config).")
 
     # Update bot profile (Bio/About)
     set_bot_profile()

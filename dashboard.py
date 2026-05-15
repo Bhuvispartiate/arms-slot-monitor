@@ -3,14 +3,22 @@ import json
 import sqlite3
 import datetime
 from pathlib import Path
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, session, redirect, url_for
 from functools import wraps
 import pytz
 import werkzeug
 
 SUBSCRIBERS_FILE = Path("subscribers.json")
 METRICS_FILE = Path("metrics.json")
+CONFIG_FILE = Path("config.json")
 IST = pytz.timezone('Asia/Kolkata')
+
+app = Flask(__name__)
+app.secret_key = "arms_monitor_secret_key_123" # In production, use a random string
+
+# User Credentials
+DASHBOARD_USER = "Knightwinner"
+DASHBOARD_PASS = "GreaterShifter"
 
 def get_ist_now():
     return datetime.datetime.now(IST)
@@ -38,20 +46,94 @@ def load_db() -> dict:
 
 def save_db(db: dict) -> None:
     SUBSCRIBERS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
-app = Flask(__name__)
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        return {"arms_username": "", "arms_password": "", "poll_interval": 20}
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except:
+        return {"arms_username": "", "arms_password": "", "poll_interval": 20}
+
+def save_config(config):
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    # Pass through HTTP errors
     if isinstance(e, werkzeug.exceptions.HTTPException):
         return jsonify({"error": e.description}), e.code
-    # Return JSON instead of HTML for non-HTTP errors
     return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
-# Authentication removed — dashboard is open access
 def requires_auth(f):
-    f.__name__ = f.__name__
-    return f
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            if request.is_json or request.path.startswith("/api/"):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        data = request.form if not request.is_json else request.json
+        username = data.get("username")
+        password = data.get("password")
+        if username == DASHBOARD_USER and password == DASHBOARD_PASS:
+            session["logged_in"] = True
+            return jsonify({"status": "success"}) if request.is_json else redirect(url_for("index"))
+        return jsonify({"error": "Invalid credentials"}), 401 if request.is_json else "Invalid credentials", 401
+    
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login | ARMS Monitor</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600&display=swap" rel="stylesheet">
+        <style>
+            :root { --bg: #0d1117; --accent: #58a6ff; --card: #161b22; }
+            body { background: var(--bg); color: white; font-family: 'Outfit', sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+            .login-card { background: var(--card); padding: 2.5rem; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); width: 100%; max-width: 380px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+            h1 { margin-bottom: 1.5rem; font-size: 1.8rem; text-align: center; background: linear-gradient(90deg, #58a6ff, #3fb950); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+            input { width: 100%; padding: 12px; margin-bottom: 1rem; border-radius: 8px; border: 1px solid #30363d; background: #010409; color: white; box-sizing: border-box; outline: none; }
+            input:focus { border-color: var(--accent); }
+            button { width: 100%; padding: 12px; border-radius: 8px; border: none; background: var(--accent); color: #0d1117; font-weight: 600; cursor: pointer; transition: 0.2s; }
+            button:hover { opacity: 0.9; transform: translateY(-1px); }
+        </style>
+    </head>
+    <body>
+        <div class="login-card">
+            <h1>ARMS Portal</h1>
+            <form method="POST">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Unlock Dashboard</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/api/config", methods=["GET", "POST"])
+@requires_auth
+def api_config():
+    if request.method == "POST":
+        data = request.json
+        config = load_config()
+        if "arms_username" in data: config["arms_username"] = data["arms_username"]
+        if "arms_password" in data: config["arms_password"] = data["arms_password"]
+        if "poll_interval" in data: config["poll_interval"] = int(data["poll_interval"])
+        save_config(config)
+        return jsonify({"status": "success"})
+    return jsonify(load_config())
 
 @app.route("/favicon.ico")
 def favicon():
@@ -60,385 +142,331 @@ def favicon():
 @app.route("/")
 @requires_auth
 def index():
-    # Return a premium Glassmorphism React/Vanilla-JS Dashboard
     html = """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>ARMS Monitor Control Panel</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+        <title>ARMS Monitor | Premium Dashboard</title>
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
         <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         <style>
             :root {
-                --bg-color: #0d1117;
-                --card-bg: rgba(22, 27, 34, 0.6);
-                --card-border: rgba(255, 255, 255, 0.1);
-                --text-main: #c9d1d9;
-                --text-muted: #8b949e;
-                --accent: #58a6ff;
-                --success: #238636;
-                --danger: #da3633;
+                --bg: #030712;
+                --surface: rgba(17, 24, 39, 0.7);
+                --border: rgba(255, 255, 255, 0.08);
+                --accent: #6366f1;
+                --accent-glow: rgba(99, 102, 241, 0.3);
+                --success: #10b981;
+                --danger: #ef4444;
+                --text: #f3f4f6;
+                --text-dim: #9ca3af;
             }
+            
+            * { box-sizing: border-box; }
             body {
-                background-color: var(--bg-color);
-                background-image: radial-gradient(circle at 15% 50%, rgba(88, 166, 255, 0.15), transparent 25%),
-                                  radial-gradient(circle at 85% 30%, rgba(35, 134, 54, 0.15), transparent 25%);
-                color: var(--text-main);
-                font-family: 'Outfit', sans-serif;
-                margin: 0;
-                padding: 2rem;
-                min-height: 100vh;
-                box-sizing: border-box;
+                margin: 0; font-family: 'Outfit', sans-serif; background: var(--bg); color: var(--text);
+                min-height: 100vh; display: flex; overflow-x: hidden;
             }
-            .container {
-                max-width: 1400px;
-                margin: 0 auto;
-                display: grid;
-                grid-template-columns: 320px 1fr;
-                gap: 2rem;
-            }
-            .header {
-                grid-column: 1 / -1;
-                display: flex;
-                flex-wrap: wrap;
-                justify-content: space-between;
-                align-items: center;
-                border-bottom: 1px solid var(--card-border);
-                padding-bottom: 1rem;
-                margin-bottom: 1rem;
-                gap: 1rem;
-            }
-            h1 { margin: 0; font-weight: 600; font-size: 1.8rem; letter-spacing: -0.5px; display:flex; align-items:center; gap: 10px; }
-            .status-badge {
-                background: rgba(35, 134, 54, 0.2);
-                color: #3fb950;
-                padding: 6px 16px;
-                border-radius: 20px;
-                font-size: 0.9rem;
-                font-weight: 600;
-                border: 1px solid rgba(63, 185, 80, 0.4);
-                animation: pulse 2s infinite;
-                white-space: nowrap;
-            }
-            @keyframes pulse {
-                0% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0.4); }
-                70% { box-shadow: 0 0 0 10px rgba(63, 185, 80, 0); }
-                100% { box-shadow: 0 0 0 0 rgba(63, 185, 80, 0); }
-            }
-            .glass-panel {
-                background: var(--card-bg);
-                backdrop-filter: blur(16px);
-                -webkit-backdrop-filter: blur(16px);
-                border: 1px solid var(--card-border);
-                border-radius: 20px;
-                padding: 1.8rem;
-                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-                margin-bottom: 1.5rem;
-            }
-            .stat-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-                gap: 1rem;
-            }
-            .stat-card {
-                background: rgba(255,255,255,0.03);
-                border-radius: 12px;
-                padding: 1.2rem;
-                border: 1px solid rgba(255,255,255,0.05);
-                transition: transform 0.2s, background 0.2s;
-            }
-            .stat-card:hover {
-                transform: translateY(-2px);
-                background: rgba(255,255,255,0.06);
-            }
-            .stat-value { font-size: 2.2rem; font-weight: 600; color: var(--accent); margin-top: 5px; line-height: 1.2;}
-            .stat-label { font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1.5px;}
             
-            #log-container {
-                background: #010409;
-                border-radius: 12px;
-                padding: 1rem;
-                height: 400px;
-                overflow-y: auto;
-                font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
-                font-size: 0.9rem;
-                line-height: 1.6;
-                border: 1px solid #30363d;
-                scrollbar-width: thin;
-                scrollbar-color: #58a6ff #010409;
+            /* Animated Background */
+            .bg-glow {
+                position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: -1;
+                background: 
+                    radial-gradient(circle at 20% 30%, rgba(99, 102, 241, 0.15) 0%, transparent 40%),
+                    radial-gradient(circle at 80% 70%, rgba(16, 185, 129, 0.1) 0%, transparent 40%);
+                filter: blur(80px);
             }
-            .log-line { border-bottom: 1px solid rgba(255,255,255,0.02); padding: 5px 0; }
-            .log-time { color: var(--text-muted); margin-right: 15px; }
-            .log-info { color: #8a2be2; }
-            .log-warn { color: #d29922; }
-            .log-err { color: var(--danger); }
-            .log-success { color: #3fb950;}
 
-            .tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; overflow-x: auto; padding-bottom: 5px; }
-            .tabs::-webkit-scrollbar { height: 4px; }
-            .tabs::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 4px; }
-            
-            .tab-btn {
-                background: rgba(255,255,255,0.05); color: var(--text-main); border: 1px solid var(--card-border);
-                padding: 10px 20px; border-radius: 10px; cursor: pointer; font-family: 'Outfit'; font-size: 1rem;
-                transition: all 0.2s ease; white-space: nowrap;
+            /* Sidebar */
+            .sidebar {
+                width: 280px; height: 100vh; background: rgba(0,0,0,0.3); border-right: 1px solid var(--border);
+                backdrop-filter: blur(20px); padding: 2rem 1.5rem; display: flex; flex-direction: column;
+                position: sticky; top: 0;
             }
-            .tab-btn:hover { background: rgba(255,255,255,0.1); }
-            .tab-btn.active { background: var(--accent); color: #000; font-weight: 600; border-color: var(--accent); box-shadow: 0 4px 15px rgba(88, 166, 255, 0.4);}
+            .brand { font-size: 1.5rem; font-weight: 600; margin-bottom: 3rem; display: flex; align-items: center; gap: 12px; }
+            .nav-link {
+                padding: 12px 16px; border-radius: 12px; cursor: pointer; color: var(--text-dim);
+                transition: 0.3s; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; font-weight: 500;
+            }
+            .nav-link:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+            .nav-link.active { background: var(--accent); color: white; box-shadow: 0 4px 15px var(--accent-glow); }
+
+            /* Main Content */
+            main { flex: 1; padding: 2rem 3rem; max-width: 1200px; margin: 0 auto; width: 100%; }
+            .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2.5rem; }
+            .status-chip { 
+                background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2);
+                color: var(--success); padding: 6px 14px; border-radius: 100px; font-size: 0.85rem; font-weight: 600;
+                display: flex; align-items: center; gap: 8px;
+            }
+            .status-dot { width: 8px; height: 8px; background: var(--success); border-radius: 50%; box-shadow: 0 0 10px var(--success); animation: pulse 2s infinite; }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
+            /* Grid Layout */
+            .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.5rem; margin-bottom: 2rem; }
+            .glass-card { 
+                background: var(--surface); border: 1px solid var(--border); backdrop-filter: blur(12px);
+                border-radius: 20px; padding: 1.5rem; box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            }
+            .stat-label { font-size: 0.85rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+            .stat-value { font-size: 1.8rem; font-weight: 600; margin-top: 8px; }
+
+            /* Terminal */
+            .terminal { 
+                background: #000; border: 1px solid var(--border); border-radius: 16px; padding: 1rem;
+                height: 450px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+                scrollbar-width: thin; scrollbar-color: var(--accent) transparent;
+            }
+            .log-entry { margin-bottom: 6px; line-height: 1.5; border-bottom: 1px solid rgba(255,255,255,0.03); padding-bottom: 4px; }
+            .log-time { color: var(--text-dim); margin-right: 12px; }
+            .log-msg-success { color: var(--success); }
+            .log-msg-error { color: var(--danger); }
+            .log-msg-info { color: var(--accent); }
+
+            /* Settings Forms */
+            .form-group { margin-bottom: 1.5rem; }
+            .form-group label { display: block; margin-bottom: 8px; color: var(--text-dim); font-size: 0.9rem; }
+            input {
+                width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); padding: 12px 16px;
+                border-radius: 12px; color: white; font-family: inherit; font-size: 1rem; outline: none; transition: 0.2s;
+            }
+            input:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-glow); }
+            .btn {
+                background: var(--accent); color: white; border: none; padding: 12px 24px; border-radius: 12px;
+                font-weight: 600; cursor: pointer; transition: 0.2s; display: inline-flex; align-items: center; gap: 8px;
+            }
+            .btn:hover { transform: translateY(-1px); opacity: 0.9; }
+            .btn-secondary { background: rgba(255,255,255,0.1); }
+
+            .slot-config-item { 
+                background: rgba(255,255,255,0.03); padding: 1rem; border-radius: 12px; margin-bottom: 12px;
+                display: flex; gap: 1rem; align-items: center;
+            }
             
-            .tab-content { display: none; animation: fadeIn 0.4s ease; }
-            .tab-content.active { display: block; }
+            .tab-content { display: none; }
+            .tab-content.active { display: block; animation: fadeIn 0.4s ease; }
             @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-            .input-group { margin-bottom: 1rem; }
-            .input-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size:0.9rem; }
-            .input-group input { 
-                width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--card-border); 
-                background: rgba(0,0,0,0.4); color: white; font-family: 'Outfit'; font-size: 1rem; box-sizing: border-box;
-                transition: border-color 0.2s;
-            }
-            .input-group input:focus { border-color: var(--accent); outline: none; }
-            
-            .btn {
-                background: var(--success); color: white; border: none; padding: 12px 24px; font-size: 1rem;
-                border-radius: 8px; cursor: pointer; font-family: 'Outfit'; font-weight: 600; transition: 0.2s; box-shadow: 0 4px 15px rgba(35, 134, 54, 0.3);
-            }
-            .btn:hover { background: #2ea043; transform: translateY(-1px); }
-            
-            .slot-row { display: flex; gap: 10px; margin-bottom: 15px; align-items:center; }
-            .slot-row input { flex:1; }
-            .btn-danger { background: var(--danger); box-shadow: 0 4px 15px rgba(218, 54, 51, 0.3); padding: 12px 16px;}
-            .btn-danger:hover { background: #f85149; }
-
-            /* Modern Mobile Responsiveness */
-            @media (max-width: 900px) {
-                body { padding: 1rem; }
-                .container { 
-                    grid-template-columns: 1fr; 
-                    gap: 1.5rem;
-                }
-                .sidebar { order: -1; } /* Bring stats to top on mobile */
-                .stat-grid { grid-template-columns: repeat(2, 1fr); }
-                .stat-card[style*="grid-column"] { grid-column: 1 / -1 !important; }
-                h1 { font-size: 1.5rem; }
-            }
-            
-            @media (max-width: 600px) {
-                body { padding: 0.5rem; }
-                .container { gap: 1rem; }
-                .glass-panel { padding: 1.2rem; border-radius: 16px; margin-bottom: 1rem; }
-                .stat-grid { gap: 0.8rem; }
-                .stat-card { padding: 1rem; }
-                .stat-value { font-size: 1.6rem; }
-                .stat-label { font-size: 0.75rem; }
-                
-                .header { flex-direction: column; align-items: flex-start; gap: 0.8rem; }
-                .status-badge { align-self: flex-start; font-size: 0.8rem; padding: 4px 12px; }
-                
-                #log-container { height: 300px; font-size: 0.8rem; padding: 0.8rem; }
-                .slot-row { flex-direction: column; align-items: stretch; background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px;}
-                .btn-danger { width: 100%; margin-top: 5px; }
-                .tab-btn { padding: 8px 16px; font-size: 0.9rem; }
-            }
-            
-            @media (max-width: 400px) {
-                .stat-grid { grid-template-columns: 1fr; }
+            @media (max-width: 1000px) {
+                .sidebar { display: none; }
+                .stats-row { grid-template-columns: repeat(2, 1fr); }
             }
         </style>
     </head>
     <body>
-        <div class="container">
+        <div class="bg-glow"></div>
+        
+        <aside class="sidebar">
+            <div class="brand">🚀 ARMS Monitor</div>
+            <nav>
+                <div class="nav-link active" onclick="switchTab('dashboard', this)"><span>📊</span> Dashboard</div>
+                <div class="nav-link" onclick="switchTab('slots', this)"><span>⚙️</span> Slots Config</div>
+                <div class="nav-link" onclick="switchTab('security', this)"><span>🔐</span> Security</div>
+                <div class="nav-link" onclick="switchTab('logs', this)"><span>📜</span> Live Logs</div>
+            </nav>
+            <div style="margin-top: auto;">
+                <a href="/logout" style="color: var(--danger); text-decoration: none; font-size: 0.9rem; font-weight: 600;">🚪 Logout System</a>
+            </div>
+        </aside>
+
+        <main>
             <div class="header">
-                <h1>🎓 ARMS Slot Monitor</h1>
-                <div class="status-badge">● SYSTEM ONLINE</div>
+                <h1 id="page-title">Dashboard Overview</h1>
+                <div class="status-chip"><div class="status-dot"></div> Live Monitoring</div>
             </div>
-            
-            <div class="sidebar">
-                <div class="glass-panel stat-grid">
-                    <div class="stat-card">
-                        <div class="stat-label">Subscribers</div>
-                        <div class="stat-value" id="sub-count">--</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">Monitored Slots</div>
-                        <div class="stat-value" id="slot-count">--</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">Total Courses</div>
-                        <div class="stat-value" id="course-count">--</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-label">System Uptime</div>
-                        <div class="stat-value" style="font-size:1.4rem;" id="uptime">--</div>
-                    </div>
-                    <div class="stat-card">
+
+            <!-- Dashboard Tab -->
+            <div id="tab-dashboard" class="tab-content active">
+                <div class="stats-row">
+                    <div class="glass-card">
                         <div class="stat-label">Total Polls</div>
-                        <div class="stat-value" id="poll-count">--</div>
+                        <div id="stat-polls" class="stat-value">--</div>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-label">API Latency</div>
-                        <div class="stat-value" id="api-latency">--</div>
+                    <div class="glass-card">
+                        <div class="stat-label">System Uptime</div>
+                        <div id="stat-uptime" class="stat-value">--</div>
                     </div>
-                    <div class="stat-card" style="grid-column: 1 / -1;">
-                        <div class="stat-label">Last Poll Update</div>
-                        <div class="stat-value" style="font-size:1.2rem; color:#c9d1d9;" id="last-poll">Waiting...</div>
+                    <div class="glass-card">
+                        <div class="stat-label">Total Courses</div>
+                        <div id="stat-courses" class="stat-value">--</div>
+                    </div>
+                    <div class="glass-card">
+                        <div class="stat-label">Latency</div>
+                        <div id="stat-latency" class="stat-value">--</div>
+                    </div>
+                </div>
+
+                <div class="glass-card" style="margin-bottom: 2rem;">
+                    <div class="stat-label" style="margin-bottom: 1.5rem;">Slot Activity (24h)</div>
+                    <div style="height: 350px;">
+                        <canvas id="mainChart"></canvas>
                     </div>
                 </div>
             </div>
 
-            <div class="main-content">
-                <div class="tabs">
-                    <button class="tab-btn active" onclick="switchTab('overview')">Overview</button>
-                    <button class="tab-btn" onclick="switchTab('settings')">Settings</button>
-                </div>
-
-                <div id="tab-overview" class="tab-content active">
-                    <div class="glass-panel">
-                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Analytics History (24h)</h2>
-                        <div style="height: 250px; width: 100%;">
-                            <canvas id="analyticsChart"></canvas>
-                        </div>
-                    </div>
-
-                    <div class="glass-panel">
-                        <h2 style="margin-top:0; font-size: 1.2rem; color: var(--text-muted);">Live Terminal Logs</h2>
-                        <div id="log-container">Loading system logs...</div>
-                    </div>
-                </div>
-
-                <div id="tab-settings" class="tab-content glass-panel">
-                    <h2 style="margin-top:0;">Slot Configuration</h2>
-                    <p style="color:var(--text-muted); font-size:0.9rem;">Change which ARMS slots are actively monitored. The background bot updates instantly upon save.</p>
-                    
-                    <div id="slots-editor"></div>
-                    
-                    <button class="tab-btn" onclick="addSlotRow()" style="margin-top:10px;">+ Add Slot</button>
-                    <br><br>
-                    <button class="btn" onclick="saveSlots()">💾 Save Configuration</button>
+            <!-- Slots Tab -->
+            <div id="tab-slots" class="tab-content">
+                <div class="glass-card">
+                    <h3 style="margin-top:0;">ARMS Monitor Slots</h3>
+                    <p style="color: var(--text-dim); font-size: 0.9rem; margin-bottom: 2rem;">Configure which Slot IDs the background engine should track.</p>
+                    <div id="slot-list"></div>
+                    <button class="btn btn-secondary" onclick="addSlotRow()" style="margin-top: 1rem;">+ Add New Slot</button>
+                    <hr style="border: 0; border-top: 1px solid var(--border); margin: 2rem 0;">
+                    <button class="btn" onclick="saveSlots()">💾 Save & Sync Bot</button>
                 </div>
             </div>
-        </div>
+
+            <!-- Security Tab -->
+            <div id="tab-security" class="tab-content">
+                <div class="glass-card">
+                    <h3 style="margin-top:0;">ARMS Portal Credentials</h3>
+                    <p style="color: var(--text-dim); font-size: 0.9rem; margin-bottom: 2rem;">These credentials are used by the bot to automatically log into the Saveetha ARMS portal.</p>
+                    
+                    <div class="form-group">
+                        <label>ARMS Username / Roll No</label>
+                        <input type="text" id="arms-user" placeholder="P1925XXXX">
+                    </div>
+                    <div class="form-group">
+                        <label>ARMS Password</label>
+                        <input type="password" id="arms-pass" placeholder="••••••••">
+                    </div>
+                    <div class="form-group">
+                        <label>Poll Interval (Seconds)</label>
+                        <input type="number" id="poll-int" value="20">
+                    </div>
+                    <button class="btn" onclick="saveConfig()">🛡️ Update Portal Access</button>
+                </div>
+            </div>
+
+            <!-- Logs Tab -->
+            <div id="tab-logs" class="tab-content">
+                <div class="glass-card">
+                    <h3 style="margin-top:0;">System Execution Logs</h3>
+                    <div id="terminal" class="terminal">Loading logs...</div>
+                </div>
+            </div>
+        </main>
 
         <script>
-            let chartInstance = null;
+            let mainChart = null;
 
-            function switchTab(tabId) {
-                document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-                document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            function switchTab(tabId, el) {
+                document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
                 document.getElementById('tab-' + tabId).classList.add('active');
-                event.target.classList.add('active');
-                if(tabId === 'settings') loadSettings();
+                el.classList.add('active');
+                document.getElementById('page-title').innerText = el.innerText.trim();
+                
+                if(tabId === 'slots') loadSlots();
+                if(tabId === 'security') loadConfig();
             }
 
-            function formatLog(line) {
-                if(!line) return '';
-                if(line.includes("GET /api/")) return ''; // Hide dashboard noise
-                let formatted = line.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-                if(formatted.includes("[Bot]") || formatted.includes("[Monitor]")) formatted = `<span class="log-info">${formatted}</span>`;
-                if(formatted.includes("⚠") || formatted.includes("WARNING")) formatted = `<span class="log-warn">${formatted}</span>`;
-                if(formatted.includes("❌") || formatted.includes("ERROR")) formatted = `<span class="log-err">${formatted}</span>`;
-                if(formatted.includes("✅") || formatted.includes("started") || formatted.includes("INCREASED")) formatted = `<span class="log-success">${formatted}</span>`;
-                const timeMatch = formatted.match(/^(\\d{2}:\\d{2}:\\d{2})\\s+(.*)/);
-                if(timeMatch) return `<div class="log-line"><span class="log-time">[${timeMatch[1]}]</span>${timeMatch[2]}</div>`;
-                return `<div class="log-line">${formatted}</div>`;
-            }
-
-            async function updateDashboard() {
+            async function updateStats() {
                 try {
-                    const statsRes = await fetch('/api/stats');
-                    const stats = await statsRes.json();
-                    document.getElementById('sub-count').innerText = stats.subscribers;
-                    document.getElementById('slot-count').innerText = stats.slots;
-                    document.getElementById('course-count').innerText = stats.total_courses;
-                    document.getElementById('uptime').innerText = stats.uptime;
-                    document.getElementById('poll-count').innerText = stats.polls;
-                    document.getElementById('api-latency').innerText = stats.latency;
-                    document.getElementById('last-poll').innerText = stats.time;
+                    const r = await fetch('/api/stats');
+                    const d = await r.json();
+                    document.getElementById('stat-polls').innerText = d.polls;
+                    document.getElementById('stat-uptime').innerText = d.uptime;
+                    document.getElementById('stat-courses').innerText = d.total_courses;
+                    document.getElementById('stat-latency').innerText = d.latency;
 
-                    const logsRes = await fetch('/api/logs');
-                    const logsData = await logsRes.json();
-                    const logContainer = document.getElementById('log-container');
-                    const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 50;
-                    logContainer.innerHTML = logsData.logs.map(formatLog).join('');
-                    if(isScrolledToBottom) logContainer.scrollTop = logContainer.scrollHeight;
+                    const lr = await fetch('/api/logs');
+                    const ld = await lr.json();
+                    const term = document.getElementById('terminal');
+                    const scroll = term.scrollHeight - term.clientHeight <= term.scrollTop + 50;
+                    term.innerHTML = ld.logs.map(l => {
+                        let cls = '';
+                        if(l.includes('✅') || l.includes('SUCCESS')) cls = 'log-msg-success';
+                        if(l.includes('❌') || l.includes('ERROR')) cls = 'log-msg-error';
+                        if(l.includes('[Bot]')) cls = 'log-msg-info';
+                        return `<div class="log-entry"><span class="log-time">[${l.substring(0,8)}]</span><span class="${cls}">${l.substring(10)}</span></div>`;
+                    }).join('');
+                    if(scroll) term.scrollTop = term.scrollHeight;
 
-                    // Fetch chart history
-                    const histRes = await fetch('/api/history');
-                    updateChart(await histRes.json());
-                } catch(e) { console.error("Update failed", e); }
+                    const hr = await fetch('/api/history');
+                    renderChart(await hr.json());
+                } catch(e) {}
             }
 
-            function updateChart(data) {
-                const ctx = document.getElementById('analyticsChart').getContext('2d');
-                if(!chartInstance) {
-                    chartInstance = new Chart(ctx, {
+            function renderChart(data) {
+                const ctx = document.getElementById('mainChart').getContext('2d');
+                if(!mainChart) {
+                    mainChart = new Chart(ctx, {
                         type: 'line',
-                        data: {
-                            labels: data.labels,
-                            datasets: data.datasets
-                        },
+                        data: data,
                         options: {
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            animation: false,
-                            scales: {
-                                y: { beginAtZero: false, grid: {color: 'rgba(255,255,255,0.05)'}, ticks: {color: '#8b949e'} },
-                                x: { grid: {display: false}, ticks: {color: '#8b949e', maxTicksLimit: 10} }
+                            responsive: true, maintainAspectRatio: false, animation: false,
+                            scales: { 
+                                y: { grid: {color: 'rgba(255,255,255,0.05)'}, ticks: {color: '#9ca3af'} },
+                                x: { grid: {display: false}, ticks: {color: '#9ca3af'} }
                             },
-                            plugins: {
-                                legend: { labels: { color: '#c9d1d9' } }
-                            }
+                            plugins: { legend: { labels: { color: '#f3f4f6', font: {family: 'Outfit'} } } }
                         }
                     });
                 } else {
-                    chartInstance.data.labels = data.labels;
-                    chartInstance.data.datasets = data.datasets;
-                    chartInstance.update();
+                    mainChart.data = data;
+                    mainChart.update();
                 }
             }
 
-            // --- Settings Editor Logic ---
-            async function loadSettings() {
-                const res = await fetch('/api/settings');
-                const data = await res.json();
-                const container = document.getElementById('slots-editor');
-                container.innerHTML = '';
-                data.slots.forEach(s => addSlotRow(s.id, s.label));
+            // --- Config & Slots ---
+            async function loadSlots() {
+                const r = await fetch('/api/settings');
+                const d = await r.json();
+                const list = document.getElementById('slot-list');
+                list.innerHTML = '';
+                d.slots.forEach(s => addSlotRow(s.id, s.label));
             }
 
-            function addSlotRow(id = '', label = '') {
-                const row = document.createElement('div');
-                row.className = 'slot-row';
-                row.innerHTML = `
-                    <input type="number" placeholder="Slot ID (e.g. 1)" value="${id}" class="s-id">
-                    <input type="text" placeholder="Label (e.g. A-1)" value="${label}" class="s-label">
-                    <button class="btn btn-danger" onclick="this.parentElement.remove()">X</button>
+            function addSlotRow(id='', label='') {
+                const div = document.createElement('div');
+                div.className = 'slot-config-item';
+                div.innerHTML = `
+                    <input type="number" value="${id}" placeholder="ID" style="width: 100px;">
+                    <input type="text" value="${label}" placeholder="Slot Name" style="flex:1;">
+                    <button class="btn btn-secondary" onclick="this.parentElement.remove()" style="padding: 10px;">✕</button>
                 `;
-                document.getElementById('slots-editor').appendChild(row);
+                document.getElementById('slot-list').appendChild(div);
             }
 
             async function saveSlots() {
-                const rows = document.querySelectorAll('.slot-row');
-                const newSlots = [];
-                rows.forEach(r => {
-                    const id = parseInt(r.querySelector('.s-id').value);
-                    const label = r.querySelector('.s-label').value;
-                    if(!isNaN(id) && label) newSlots.push({id, label});
+                const slots = [];
+                document.querySelectorAll('.slot-config-item').forEach(row => {
+                    const inputs = row.querySelectorAll('input');
+                    if(inputs[0].value && inputs[1].value) slots.push({id: parseInt(inputs[0].value), label: inputs[1].value});
                 });
-                
                 await fetch('/api/settings', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({slots: newSlots})
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({slots})
                 });
-                alert('Saved! The bot will use these slots on its next poll.');
+                alert('Slots updated successfully!');
             }
 
-            // Init loop
-            updateDashboard();
-            setInterval(updateDashboard, 5000);
+            async function loadConfig() {
+                const r = await fetch('/api/config');
+                const d = await r.json();
+                document.getElementById('arms-user').value = d.arms_username;
+                document.getElementById('arms-pass').value = d.arms_password;
+                document.getElementById('poll-int').value = d.poll_interval;
+            }
+
+            async function saveConfig() {
+                const data = {
+                    arms_username: document.getElementById('arms-user').value,
+                    arms_password: document.getElementById('arms-pass').value,
+                    poll_interval: parseInt(document.getElementById('poll-int').value)
+                };
+                await fetch('/api/config', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(data)
+                });
+                alert('Security credentials updated! The bot will now use these for ARMS login.');
+            }
+
+            updateStats();
+            setInterval(updateStats, 5000);
         </script>
     </body>
     </html>

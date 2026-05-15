@@ -69,7 +69,7 @@ HEADERS = {
 POLL_INTERVAL = 20
 
 # ── Telegram ─────────────────────
-TELEGRAM_BOT_TOKEN = "8340772186:AAGpn5IZx6Af_3oQaomJir2itlfiCmQJI3s"
+TELEGRAM_BOT_TOKEN = "8340772186:AAFIec3xF738rknAyQKkEtTZl0ItCnhFNXI"
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 ADMIN_CHAT_ID      = "8467592443"        # only this ID can run admin commands

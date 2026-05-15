@@ -6,6 +6,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, Response
 from functools import wraps
 import pytz
+import werkzeug
 
 SUBSCRIBERS_FILE = Path("subscribers.json")
 METRICS_FILE = Path("metrics.json")
@@ -38,6 +39,14 @@ def load_db() -> dict:
 def save_db(db: dict) -> None:
     SUBSCRIBERS_FILE.write_text(json.dumps(db, indent=2, ensure_ascii=False), encoding="utf-8")
 app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Pass through HTTP errors
+    if isinstance(e, werkzeug.exceptions.HTTPException):
+        return jsonify({"error": e.description}), e.code
+    # Return JSON instead of HTML for non-HTTP errors
+    return jsonify({"error": str(e), "type": type(e).__name__}), 500
 
 # Authentication removed — dashboard is open access
 def requires_auth(f):

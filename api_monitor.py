@@ -26,14 +26,10 @@ import html
 from datetime import datetime
 import pytz
 from pathlib import Path
-from dotenv import load_dotenv
 import signal
 import sys
 import http.server
 import socketserver
-
-# Load secrets from .env file if present (Wispbyte / local dev)
-load_dotenv()
 
 # ─────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -51,8 +47,7 @@ ARMS_PASSWORD = "welcome"      # ARMS password
 ARMS_LOGIN_URL = "https://arms.sse.saveetha.com/Login.aspx?s=exp"
 
 # ARMS session cookie — auto-refreshed via login; also settable via /setcookie
-_session = os.environ.get("ARMS_SESSION", "")
-COOKIES = {"ASP.NET_SessionId": _session}
+COOKIES = {"ASP.NET_SessionId": ""}
 
 # Error alert rate-limiting: only alert admin once per error type per hour
 _last_alert: dict[str, float] = {}
@@ -74,18 +69,18 @@ HEADERS = {
 POLL_INTERVAL = 20
 
 # ── Telegram ─────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = "8340772186:AAGa3fzCjNr4TClpvjuRQzizpSaF521-SuY"
 TELEGRAM_API       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-ADMIN_CHAT_ID      = os.environ.get("ADMIN_CHAT_ID", "")       # only this ID can run admin commands
-ADMIN_PHONE        = os.environ.get("ADMIN_PHONE", "")          # your phone number (for reference)
-CHANNEL_CHAT_ID    = os.environ.get("CHANNEL_CHAT_ID", "")      # private channel — all slot alerts go here
+ADMIN_CHAT_ID      = "8467592443"        # only this ID can run admin commands
+ADMIN_PHONE        = "9360406137"         # your phone number (for reference)
+CHANNEL_CHAT_ID    = "-1003845063774"    # private channel — all slot alerts go here
 
 # File that stores subscribers across restarts
 SUBSCRIBERS_FILE   = Path("subscribers.json")
 
 # Dashboard URL for notifications
-DASHBOARD_URL      = os.environ.get("DASHBOARD_URL", "")
+DASHBOARD_URL      = "https://your-site.alwaysdata.net"
 
 # ─────────────────────────────────────────────────────
 #  LOGGING

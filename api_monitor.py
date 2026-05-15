@@ -91,7 +91,7 @@ CHANNEL_CHAT_ID    = "-1003845063774"    # private channel — all slot alerts g
 SUBSCRIBERS_FILE   = Path("subscribers.json")
 
 # Dashboard URL for notifications
-DASHBOARD_URL      = "https://your-site.alwaysdata.net"
+DASHBOARD_URL      = "http://arms-course-monitor.alwaysdata.net/"
 
 # ─────────────────────────────────────────────────────
 #  LOGGING
@@ -791,14 +791,17 @@ def monitor_thread():
                         pass  # Reduced logging: only log on changes
 
             except Exception as e:
-                log.error(f"  [Slot {slot_label}] ❌ Error processing courses: {e}")
+                import traceback
+                error_msg = f"  [Slot {slot_label}] ❌ Error processing courses: {e}\n{traceback.format_exc()}"
+                log.error(error_msg)
+                # Notify admin of major persistent errors (once per hour)
+                alert_admin_error(f"Error processing {slot_label}", str(e))
         
         cycle_end_t = time.time()
         GLOBAL_METRICS["latency"] = f"{(cycle_end_t - cycle_start_t):.2f}s"
         GLOBAL_METRICS["total_courses"] = cycle_courses_count
 
         try:
-            import json
             with open("metrics.json", "w") as mf:
                 json.dump({
                     "start_time": GLOBAL_METRICS["start_time"].isoformat(),
@@ -812,6 +815,19 @@ def monitor_thread():
         # Sleep before next poll
         time.sleep(poll_interval)
 
+def alert_admin_error(error_type: str, details: str):
+    """Notify admin of an error, with a cooldown to prevent spam."""
+    global _last_alert
+    now = time.time()
+    if now - _last_alert.get(error_type, 0) > 3600:
+        send_message(
+            ADMIN_CHAT_ID,
+            f"⚠️ <b>System Error</b>\n\n"
+            f"Type: <code>{error_type}</code>\n"
+            f"Details: <code>{details}</code>\n\n"
+            "<i>Check the dashboard logs for details.</i>"
+        )
+        _last_alert[error_type] = now
 
 # ─────────────────────────────────────────────────────
 #  SHUTDOWN HANDLER
@@ -820,26 +836,15 @@ def monitor_thread():
 def handle_shutdown(signum=None, frame=None):
     """Notify admin and exit gracefully on shutdown signals."""
     sig_name = signal.Signals(signum).name if signum else "Manual shutdown"
-    reason_map = {
-        "SIGINT":  "Ctrl+C pressed / manual stop",
-        "SIGTERM": "Server terminated (platform restart or deploy)",
-        "Manual shutdown": "Unhandled exception in monitor thread",
-    }
-    reason = reason_map.get(sig_name, f"Signal: {sig_name}")
     log.info(f"\n[System] 🛑 Shutdown signal ({sig_name}) received. Notifying admin…")
-    try:
-        send_message(
-            ADMIN_CHAT_ID,
-            "🛑 <b>ARMS Monitor — Server Powering Down</b>\n\n"
-            f"📌 <b>Reason:</b> {reason}\n\n"
-            "Monitoring will be paused until the service is back online.\n"
-            f"🕐 <i>{datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}</i>"
-        )
-    except Exception as e:
-        log.error(f"  [System] Failed to send shutdown message: {e}")
     
-    log.info("Goodbye!")
-    os._exit(0)  # Kill all threads and exit immediately
+    send_message(
+        ADMIN_CHAT_ID,
+        f"🛑 <b>Monitor Stopped</b>\n"
+        f"Signal: <code>{sig_name}</code>\n"
+        f"Time: {get_ist_now().strftime('%Y-%m-%d %I:%M:%S %p')}"
+    )
+    sys.exit(0)
 
 
 # ─────────────────────────────────────────────────────
@@ -872,11 +877,13 @@ if __name__ == "__main__":
 
     # Startup message to admin
     slot_labels_str = ", ".join(s["label"] for s in active_slots_init) if active_slots_init else "None"
+    poll_int = CONFIG.get("poll_interval", 20)
     send_message(
         ADMIN_CHAT_ID,
         "🚀 <b>ARMS Slot Monitor is running!</b>\n\n"
         f"👁 Watching Slots: <b>{slot_labels_str}</b>\n"
-        f"⏱ Poll Interval: every <b>{POLL_INTERVAL}s</b>\n"
+        f"⏱ Poll Interval: every <b>{poll_int}s</b>\n"
+        f"🌐 Dashboard: {DASHBOARD_URL}\n\n"
         "/setcookie &lt;value&gt; – update session cookie live"
     )
 
